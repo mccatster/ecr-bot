@@ -161,17 +161,16 @@ client.on(Events.MessageCreate, async message => {
         try { await message.delete(); } catch (_) {}
 
         const consoleChannel = await client.channels.fetch(CONSOLE_CHANNEL_ID);
-        const msg = await consoleChannel.send({
+        await consoleChannel.send({
             embeds: [
                 new EmbedBuilder()
                     .setDescription('## owners\ntype a command')
-                    .setColor(0x2b2d31)
-                    .setFooter({ text: 'ECR Console • Auto-deletes in 60s' })
+                    .setColor(0xB9B4FF)
+                    .setFooter({ text: 'ECR Console' })
             ],
             components: [buildConsoleButton()],
         });
 
-        setTimeout(() => msg.delete().catch(() => {}), 60_000);
         return;
     }
 
