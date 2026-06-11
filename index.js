@@ -22,14 +22,12 @@ const RAIDBAN_LOG_CHANNEL_ID = '1490125476671520939';
 const RAIDBAN_ROLE_ID = '1482487254814294170';
 const PREFIX = ';';
 
-// Only these user IDs can use ;console
 const CONSOLE_ALLOWED_USERS = [
     '477575548944777226',
     '1041158415713583185',
     '1154253852476973086'
 ];
 
-// Roles that can use general staff commands (raidsetup, editst, editet, help)
 const ALLOWED_ROLES = [
     '1386463199355736114',
     '1418316070560731339',
@@ -37,7 +35,12 @@ const ALLOWED_ROLES = [
     '1386139144971096115'
 ];
 
-// Roles/users that can use ;raidban
+// Users who bypass the role check entirely for all commands
+const SUPERUSERS = [
+    '477575548944777226',
+    '1041158415713583185'
+];
+
 const RAIDBAN_ALLOWED_ROLES = [
     '1310373664998555701'
 ];
@@ -46,7 +49,7 @@ const RAIDBAN_ALLOWED_USERS = [
     '1041158415713583185'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban'];
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban'];
 
 function loadRaidMessages() {
     if (fs.existsSync(DATA_FILE)) {
@@ -69,6 +72,7 @@ function generateRaidId(existingIds) {
 }
 
 function hasPermission(member) {
+    if (SUPERUSERS.includes(member.user.id)) return true;
     return ALLOWED_ROLES.some(id => member.roles.cache.has(id));
 }
 
@@ -85,7 +89,7 @@ function buildConsoleModal() {
     const input = new TextInputBuilder()
         .setCustomId('console_input')
         .setLabel('type a command')
-        .setPlaceholder('raidsetup | editst | editet')
+        .setPlaceholder('e.g. raidsetup Raid Name | <t:...> | <t:...> | Role')
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true);
 
@@ -113,7 +117,7 @@ function buildHelpEmbed() {
             {
                 name: '⚔️  ;raidsetup',
                 value: [
-                    '**Description:** Creates a new raid signup post in the raid channel and generates a unique Raid ID.',
+                    '**Description:** Creates a new raid signup post and generates a unique Raid ID.',
                     '**Usage:** `;raidsetup Raid Name, Start Timestamp, End Timestamp, Role Name`',
                     '**Fields:**',
                     '› `Raid Name` — the name of the raid',
@@ -157,9 +161,20 @@ function buildHelpEmbed() {
                 ].join('\n'),
             },
             {
+                name: '🔓  ;unraidban',
+                value: [
+                    '**Description:** Removes the raid-ban role from a user and logs the action.',
+                    '**Usage:** `;unraidban <@user or user ID> [reason]`',
+                    '**Fields:**',
+                    '› `@user or user ID` — mention or paste the user\'s ID',
+                    '› `reason` — optional reason (shows *no reason given* if omitted)',
+                    '**Who can use:** Senior staff roles and server owners',
+                ].join('\n'),
+            },
+            {
                 name: '⌨️  ;console',
                 value: [
-                    '**Description:** Opens a private console panel in the console channel with a text input to run commands.',
+                    '**Description:** Opens a private console panel to run commands.',
                     '**Usage:** `;console`',
                     '**Who can use:** Server owners only (restricted by user ID)',
                 ].join('\n'),
@@ -175,16 +190,11 @@ function buildHelpEmbed() {
         );
 }
 
-// Parse console input — splits on first space only for editst/editet,
-// and on first 3 spaces for raidsetup to preserve timestamps
 function parseConsoleInput(raw) {
     const parts = raw.trim().split(/\s+/);
     const cmd = parts[0].toLowerCase();
 
     if (cmd === 'raidsetup') {
-        // Format: raidsetup "Raid Name" startTimestamp endTimestamp roleName
-        // We split into exactly 5 parts: cmd, name, start, end, role
-        // Everything after the cmd is re-joined and split by | delimiter
         const rest = raw.trim().slice('raidsetup'.length).trim();
         const fields = rest.split('|').map(s => s.trim());
         if (fields.length < 4) return null;
@@ -192,11 +202,27 @@ function parseConsoleInput(raw) {
     }
 
     if (cmd === 'editst' || cmd === 'editet') {
-        // Format: editst raidId timestamp
         const raidId = parts[1];
         const timestamp = parts.slice(2).join(' ');
         if (!raidId || !timestamp) return null;
         return { cmd, raidId, timestamp };
+    }
+
+    if (cmd === 'raidban' || cmd === 'unraidban') {
+        const rest = raw.trim().slice(cmd.length).trim();
+        const mentionMatch = rest.match(/^<@!?(\d+)>/);
+        const idMatch = rest.match(/^(\d+)/);
+        let targetId, reason;
+        if (mentionMatch) {
+            targetId = mentionMatch[1];
+            reason = rest.slice(mentionMatch[0].length).trim() || 'no reason given';
+        } else if (idMatch) {
+            targetId = idMatch[1];
+            reason = rest.slice(idMatch[0].length).trim() || 'no reason given';
+        } else {
+            return null;
+        }
+        return { cmd, targetId, reason };
     }
 
     return { cmd };
@@ -237,7 +263,7 @@ client.on(Events.MessageCreate, async message => {
 
     if (!KNOWN_COMMANDS.includes(command)) return;
 
-    // ;console — console users only, before any role gate
+    // ;console — console users only
     if (command === 'console') {
         if (!CONSOLE_ALLOWED_USERS.includes(message.author.id)) return;
         try { await message.delete(); } catch (_) {}
@@ -254,15 +280,13 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
-    // ;raidban — its own permission check, before general role gate
+    // ;raidban — own permission check
     if (command === 'raidban') {
         if (!hasRaidBanPermission(message.member)) return;
-
         const args = fullContent.slice('raidban'.length).trim();
         const mentionMatch = args.match(/^<@!?(\d+)>/);
         const idMatch = args.match(/^(\d+)/);
         let targetId, remainingText;
-
         if (mentionMatch) {
             targetId = mentionMatch[1];
             remainingText = args.slice(mentionMatch[0].length).trim();
@@ -272,43 +296,72 @@ client.on(Events.MessageCreate, async message => {
         } else {
             return message.reply('Usage: `;raidban <@user or user ID> [reason]`');
         }
-
         const reason = remainingText || 'no reason given';
-
         let targetMember;
         try {
             targetMember = await message.guild.members.fetch(targetId);
         } catch {
             return message.reply('❌ Could not find that user in this server.');
         }
-
         try {
             await targetMember.roles.add(RAIDBAN_ROLE_ID);
-            const issuerName = message.author.username;
-            const targetName = targetMember.user.username;
             const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
             await logChannel.send(
-                `✅ **${issuerName}** raid-banned **${targetName} (${targetId})**\n` +
+                `✅ **${message.author.username}** raid-banned **${targetMember.user.username} (${targetId})**\n` +
                 `Reason: *${reason}*`
             );
         } catch (error) {
             console.error(error);
             await message.reply('❌ Failed to apply raid-ban role.');
         }
-
         return;
     }
 
-    // All remaining commands require an allowed role
+    // ;unraidban — same permission as raidban
+    if (command === 'unraidban') {
+        if (!hasRaidBanPermission(message.member)) return;
+        const args = fullContent.slice('unraidban'.length).trim();
+        const mentionMatch = args.match(/^<@!?(\d+)>/);
+        const idMatch = args.match(/^(\d+)/);
+        let targetId, remainingText;
+        if (mentionMatch) {
+            targetId = mentionMatch[1];
+            remainingText = args.slice(mentionMatch[0].length).trim();
+        } else if (idMatch) {
+            targetId = idMatch[1];
+            remainingText = args.slice(idMatch[0].length).trim();
+        } else {
+            return message.reply('Usage: `;unraidban <@user or user ID> [reason]`');
+        }
+        const reason = remainingText || 'no reason given';
+        let targetMember;
+        try {
+            targetMember = await message.guild.members.fetch(targetId);
+        } catch {
+            return message.reply('❌ Could not find that user in this server.');
+        }
+        try {
+            await targetMember.roles.remove(RAIDBAN_ROLE_ID);
+            const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
+            await logChannel.send(
+                `✅ **${message.author.username}** removed the raid-ban from **${targetMember.user.username} (${targetId})**\n` +
+                `Reason: *${reason}*`
+            );
+        } catch (error) {
+            console.error(error);
+            await message.reply('❌ Failed to remove raid-ban role.');
+        }
+        return;
+    }
+
+    // All remaining commands — role check with superuser bypass
     if (!hasPermission(message.member)) return;
 
-    // ;help
     if (command === 'help') {
         await message.channel.send({ embeds: [buildHelpEmbed()] });
         return;
     }
 
-    // ;raidsetup
     if (command === 'raidsetup') {
         const args = fullContent.slice('raidsetup'.length).trim().split(',');
         if (args.length < 4) return message.reply('Usage: `;raidsetup Raid Name, Start Timestamp, End Timestamp, Role Name`');
@@ -321,7 +374,6 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
-    // ;editst
     if (command === 'editst') {
         const parts = fullContent.slice('editst'.length).trim().split(/\s+(.+)/);
         if (!parts[0] || !parts[1]) return message.reply('Usage: `;editst <raid id> <timestamp>`');
@@ -329,7 +381,6 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
-    // ;editet
     if (command === 'editet') {
         const parts = fullContent.slice('editet'.length).trim().split(/\s+(.+)/);
         if (!parts[0] || !parts[1]) return message.reply('Usage: `;editet <raid id> <timestamp>`');
@@ -366,9 +417,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
         if (cmd === 'raidsetup') {
             if (!parsed.raidName || !parsed.startTime || !parsed.endTime || !parsed.roleName) {
-                return interaction.editReply(
-                    '❌ Usage:\n`raidsetup Raid Name | <t:timestamp:F> | <t:timestamp:F> | Role Name`'
-                );
+                return interaction.editReply('❌ Usage: `raidsetup Raid Name | <t:...> | <t:...> | Role Name`');
             }
             await handleRaidSetup(interaction, {
                 raidName:  parsed.raidName,
@@ -393,6 +442,58 @@ client.on(Events.InteractionCreate, async interaction => {
             }
             await handleEditEndTime(interaction, parsed.raidId, parsed.timestamp);
             return;
+        }
+
+        if (cmd === 'raidban') {
+            if (!parsed.targetId) {
+                return interaction.editReply('❌ Usage: `raidban <user ID> [reason]`');
+            }
+            let targetMember;
+            try {
+                targetMember = await interaction.guild.members.fetch(parsed.targetId);
+            } catch {
+                return interaction.editReply('❌ Could not find that user in this server.');
+            }
+            try {
+                await targetMember.roles.add(RAIDBAN_ROLE_ID);
+                const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
+                await logChannel.send(
+                    `✅ **${interaction.user.username}** raid-banned **${targetMember.user.username} (${parsed.targetId})**\n` +
+                    `Reason: *${parsed.reason}*`
+                );
+                return interaction.editReply(`✅ **${targetMember.user.username}** has been raid-banned.`);
+            } catch (error) {
+                console.error(error);
+                return interaction.editReply('❌ Failed to apply raid-ban role.');
+            }
+        }
+
+        if (cmd === 'unraidban') {
+            if (!parsed.targetId) {
+                return interaction.editReply('❌ Usage: `unraidban <user ID> [reason]`');
+            }
+            let targetMember;
+            try {
+                targetMember = await interaction.guild.members.fetch(parsed.targetId);
+            } catch {
+                return interaction.editReply('❌ Could not find that user in this server.');
+            }
+            try {
+                await targetMember.roles.remove(RAIDBAN_ROLE_ID);
+                const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
+                await logChannel.send(
+                    `✅ **${interaction.user.username}** removed the raid-ban from **${targetMember.user.username} (${parsed.targetId})**\n` +
+                    `Reason: *${parsed.reason}*`
+                );
+                return interaction.editReply(`✅ Raid-ban removed from **${targetMember.user.username}**.`);
+            } catch (error) {
+                console.error(error);
+                return interaction.editReply('❌ Failed to remove raid-ban role.');
+            }
+        }
+
+        if (cmd === 'help') {
+            return interaction.editReply({ embeds: [buildHelpEmbed()] });
         }
 
         return interaction.editReply(`❌ Unknown command: \`${cmd}\``);
