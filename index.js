@@ -32,6 +32,8 @@ const ALLOWED_ROLES = [
     '1386139144971096115'
 ];
 
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help'];
+
 const CONSOLE_COMMANDS = [
     {
         id: 'raidsetup',
@@ -120,6 +122,67 @@ function buildConsoleButton() {
     );
 }
 
+function buildHelpEmbed() {
+    return new EmbedBuilder()
+        .setTitle('ECR Console — Command List')
+        .setColor(0xB9B4FF)
+        .setFooter({ text: 'ECR Console' })
+        .setTimestamp()
+        .addFields(
+            {
+                name: '⚔️  ;raidsetup',
+                value: [
+                    '**Description:** Creates a new raid signup post in the raid channel and generates a unique Raid ID.',
+                    '**Usage:** `;raidsetup Raid Name, Start Timestamp, End Timestamp, Role Name`',
+                    '**Fields:**',
+                    '› `Raid Name` — the name of the raid',
+                    '› `Start Timestamp` — Discord timestamp e.g. `<t:1700000000:F>`',
+                    '› `End Timestamp` — Discord timestamp e.g. `<t:1700003600:F>`',
+                    '› `Role Name` — role to assign to signups (created if it doesn\'t exist)',
+                    '**Who can use:** Members with an allowed staff role',
+                ].join('\n'),
+            },
+            {
+                name: '🕐  ;editst',
+                value: [
+                    '**Description:** Edits the start time of an existing raid post.',
+                    '**Usage:** `;editst <Raid ID> <New Timestamp>`',
+                    '**Fields:**',
+                    '› `Raid ID` — the 10-digit ID returned when the raid was created',
+                    '› `New Timestamp` — Discord timestamp e.g. `<t:1700000000:F>`',
+                    '**Who can use:** Members with an allowed staff role',
+                ].join('\n'),
+            },
+            {
+                name: '🕙  ;editet',
+                value: [
+                    '**Description:** Edits the end time of an existing raid post.',
+                    '**Usage:** `;editet <Raid ID> <New Timestamp>`',
+                    '**Fields:**',
+                    '› `Raid ID` — the 10-digit ID returned when the raid was created',
+                    '› `New Timestamp` — Discord timestamp e.g. `<t:1700003600:F>`',
+                    '**Who can use:** Members with an allowed staff role',
+                ].join('\n'),
+            },
+            {
+                name: '⌨️  ;console',
+                value: [
+                    '**Description:** Opens a private console panel in the console channel with a text input to run commands.',
+                    '**Usage:** `;console`',
+                    '**Who can use:** Server owners only (restricted by user ID)',
+                ].join('\n'),
+            },
+            {
+                name: '📋  ;help',
+                value: [
+                    '**Description:** Displays this command list.',
+                    '**Usage:** `;help`',
+                    '**Who can use:** Members with an allowed staff role',
+                ].join('\n'),
+            }
+        );
+}
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -153,10 +216,12 @@ client.on(Events.MessageCreate, async message => {
     const fullContent = message.content.slice(PREFIX.length).trim();
     const command = fullContent.split(/\s+/)[0].toLowerCase();
 
+    // Silently ignore anything that isn't a known command
+    if (!KNOWN_COMMANDS.includes(command)) return;
+
+    // ;console — owner only
     if (command === 'console') {
-        if (!CONSOLE_ALLOWED_USERS.includes(message.author.id)) {
-            return message.reply('You do not have permission to use this command.');
-        }
+        if (!CONSOLE_ALLOWED_USERS.includes(message.author.id)) return;
 
         try { await message.delete(); } catch (_) {}
 
@@ -174,10 +239,16 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
-    if (!hasPermission(message.member)) {
-        return message.reply('You do not have permission to use this command.');
+    // All other commands require an allowed role
+    if (!hasPermission(message.member)) return;
+
+    // ;help
+    if (command === 'help') {
+        await message.channel.send({ embeds: [buildHelpEmbed()] });
+        return;
     }
 
+    // ;raidsetup
     if (command === 'raidsetup') {
         const args = fullContent.slice('raidsetup'.length).trim().split(',');
         if (args.length < 4) return message.reply('Usage: `;raidsetup Raid Name, Start Timestamp, End Timestamp, Role Name`');
@@ -190,6 +261,7 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
+    // ;editst
     if (command === 'editst') {
         const parts = fullContent.slice('editst'.length).trim().split(/\s+(.+)/);
         if (!parts[0] || !parts[1]) return message.reply('Usage: `;editst <raid id> <timestamp>`');
@@ -197,6 +269,7 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
+    // ;editet
     if (command === 'editet') {
         const parts = fullContent.slice('editet'.length).trim().split(/\s+(.+)/);
         if (!parts[0] || !parts[1]) return message.reply('Usage: `;editet <raid id> <timestamp>`');
