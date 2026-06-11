@@ -18,6 +18,8 @@ const DATA_FILE = './raidMessages.json';
 const RAID_CHANNEL_ID = '1386132453017518272';
 const SUCCESS_CHANNEL_ID = '1490125476671520939';
 const CONSOLE_CHANNEL_ID = '1490491292101251144';
+const RAIDBAN_LOG_CHANNEL_ID = '1490125476671520939';
+const RAIDBAN_ROLE_ID = '1482487254814294170';
 const PREFIX = ';';
 const CONSOLE_ALLOWED_USERS = [
     '477575548944777226',
@@ -32,7 +34,13 @@ const ALLOWED_ROLES = [
     '1386139144971096115'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help'];
+const RAIDBAN_ALLOWED_ROLES = [
+    '1310373664998555701',
+    '1154253852476973086'
+];
+const RAIDBAN_ALLOWED_USERS = ['477575548944777226'];
+
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban'];
 
 const CONSOLE_COMMANDS = [
     {
@@ -94,6 +102,11 @@ function generateRaidId(existingIds) {
 
 function hasPermission(member) {
     return ALLOWED_ROLES.some(id => member.roles.cache.has(id));
+}
+
+function hasRaidBanPermission(member) {
+    return RAIDBAN_ALLOWED_USERS.includes(member.user.id) ||
+        RAIDBAN_ALLOWED_ROLES.some(id => member.roles.cache.has(id));
 }
 
 function buildConsoleModal() {
@@ -165,6 +178,17 @@ function buildHelpEmbed() {
                 ].join('\n'),
             },
             {
+                name: '🔨  ;raidban <@user> [reason]',
+                value: [
+                    '**Description:** Permanently assigns the raid-ban role to a user.',
+                    '**Usage:** `;raidban <@user> reason` (reason is optional)',
+                    '**Fields:**',
+                    '› `@user` — mention the user to raid-ban',
+                    '› `reason` — optional reason for the ban',
+                    '**Who can use:** Senior staff roles and server owner',
+                ].join('\n'),
+            },
+            {
                 name: '⌨️  ;console',
                 value: [
                     '**Description:** Opens a private console panel in the console channel with a text input to run commands.',
@@ -216,7 +240,6 @@ client.on(Events.MessageCreate, async message => {
     const fullContent = message.content.slice(PREFIX.length).trim();
     const command = fullContent.split(/\s+/)[0].toLowerCase();
 
-    // Silently ignore anything that isn't a known command
     if (!KNOWN_COMMANDS.includes(command)) return;
 
     // ;console — owner only
@@ -235,6 +258,48 @@ client.on(Events.MessageCreate, async message => {
             ],
             components: [buildConsoleButton()],
         });
+
+        return;
+    }
+
+    // ;raidban
+    if (command === 'raidban') {
+        if (!hasRaidBanPermission(message.member)) return;
+
+        const args = fullContent.slice('raidban'.length).trim();
+        const mentionMatch = args.match(/^<@!?(\d+)>/);
+
+        if (!mentionMatch) {
+            return message.reply('Usage: `;raidban <@user> [reason]`');
+        }
+
+        const targetId = mentionMatch[1];
+        const reason = args.slice(mentionMatch[0].length).trim() || '*no reason given*';
+
+        let targetMember;
+        try {
+            targetMember = await message.guild.members.fetch(targetId);
+        } catch {
+            return message.reply('❌ Could not find that user in this server.');
+        }
+
+        try {
+            await targetMember.roles.add(RAIDBAN_ROLE_ID);
+
+            const issuerName = message.author.username;
+            const targetName = targetMember.user.username;
+
+            const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
+            await logChannel.send(
+                `✅ **${issuerName}** raid-banned **${targetName} (${targetId})**\n` +
+                `**Reason:** ${reason}`
+            );
+
+            await message.reply(`✅ **${targetName}** has been raid-banned.`);
+        } catch (error) {
+            console.error(error);
+            await message.reply('❌ Failed to apply raid-ban role.');
+        }
 
         return;
     }
