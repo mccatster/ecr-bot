@@ -35,10 +35,13 @@ const ALLOWED_ROLES = [
 ];
 
 const RAIDBAN_ALLOWED_ROLES = [
-    '1310373664998555701',
-    '1154253852476973086'
+    '1310373664998555701'
 ];
-const RAIDBAN_ALLOWED_USERS = ['477575548944777226'];
+const RAIDBAN_ALLOWED_USERS = [
+    '477575548944777226',
+    '1154253852476973086',
+    '1041158415713583185'
+];
 
 const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban'];
 
@@ -178,14 +181,14 @@ function buildHelpEmbed() {
                 ].join('\n'),
             },
             {
-                name: '🔨  ;raidban <@user> [reason]',
+                name: '🔨  ;raidban',
                 value: [
-                    '**Description:** Permanently assigns the raid-ban role to a user.',
-                    '**Usage:** `;raidban <@user> reason` (reason is optional)',
+                    '**Description:** Permanently assigns the raid-ban role to a user and logs the action.',
+                    '**Usage:** `;raidban <@user> [reason]`',
                     '**Fields:**',
                     '› `@user` — mention the user to raid-ban',
-                    '› `reason` — optional reason for the ban',
-                    '**Who can use:** Senior staff roles and server owner',
+                    '› `reason` — optional reason (shows *no reason given* if omitted)',
+                    '**Who can use:** Senior staff roles and server owners',
                 ].join('\n'),
             },
             {
