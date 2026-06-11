@@ -184,9 +184,9 @@ function buildHelpEmbed() {
                 name: '🔨  ;raidban',
                 value: [
                     '**Description:** Permanently assigns the raid-ban role to a user and logs the action.',
-                    '**Usage:** `;raidban <@user> [reason]`',
+                    '**Usage:** `;raidban <@user or user ID> [reason]`',
                     '**Fields:**',
-                    '› `@user` — mention the user to raid-ban',
+                    '› `@user or user ID` — mention or paste the user\'s ID',
                     '› `reason` — optional reason (shows *no reason given* if omitted)',
                     '**Who can use:** Senior staff roles and server owners',
                 ].join('\n'),
@@ -245,7 +245,7 @@ client.on(Events.MessageCreate, async message => {
 
     if (!KNOWN_COMMANDS.includes(command)) return;
 
-    // ;console — owner only
+    // ;console — checked first, before any role gate
     if (command === 'console') {
         if (!CONSOLE_ALLOWED_USERS.includes(message.author.id)) return;
 
@@ -265,19 +265,28 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
-    // ;raidban
+    // ;raidban — checked before role gate, has its own permission check
     if (command === 'raidban') {
         if (!hasRaidBanPermission(message.member)) return;
 
         const args = fullContent.slice('raidban'.length).trim();
-        const mentionMatch = args.match(/^<@!?(\d+)>/);
 
-        if (!mentionMatch) {
-            return message.reply('Usage: `;raidban <@user> [reason]`');
+        // Accept both a mention (<@id>) and a raw user ID
+        const mentionMatch = args.match(/^<@!?(\d+)>/);
+        const idMatch = args.match(/^(\d+)/);
+        let targetId, remainingText;
+
+        if (mentionMatch) {
+            targetId = mentionMatch[1];
+            remainingText = args.slice(mentionMatch[0].length).trim();
+        } else if (idMatch) {
+            targetId = idMatch[1];
+            remainingText = args.slice(idMatch[0].length).trim();
+        } else {
+            return message.reply('Usage: `;raidban <@user or user ID> [reason]`');
         }
 
-        const targetId = mentionMatch[1];
-        const reason = args.slice(mentionMatch[0].length).trim() || '*no reason given*';
+        const reason = remainingText || '*no reason given*';
 
         let targetMember;
         try {
@@ -307,7 +316,7 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
-    // All other commands require an allowed role
+    // Remaining commands require an allowed role
     if (!hasPermission(message.member)) return;
 
     // ;help
