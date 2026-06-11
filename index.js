@@ -21,12 +21,15 @@ const CONSOLE_CHANNEL_ID = '1490491292101251144';
 const RAIDBAN_LOG_CHANNEL_ID = '1490125476671520939';
 const RAIDBAN_ROLE_ID = '1482487254814294170';
 const PREFIX = ';';
+
+// Only these user IDs can use ;console
 const CONSOLE_ALLOWED_USERS = [
     '477575548944777226',
     '1041158415713583185',
     '1154253852476973086'
 ];
 
+// Roles that can use general staff commands (raidsetup, editst, editet, help)
 const ALLOWED_ROLES = [
     '1386463199355736114',
     '1418316070560731339',
@@ -34,54 +37,16 @@ const ALLOWED_ROLES = [
     '1386139144971096115'
 ];
 
+// Roles/users that can use ;raidban
 const RAIDBAN_ALLOWED_ROLES = [
     '1310373664998555701'
 ];
 const RAIDBAN_ALLOWED_USERS = [
     '477575548944777226',
-    '1154253852476973086',
     '1041158415713583185'
 ];
 
 const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban'];
-
-const CONSOLE_COMMANDS = [
-    {
-        id: 'raidsetup',
-        label: 'Raid Setup',
-        emoji: '⚔️',
-        style: ButtonStyle.Danger,
-        modalTitle: 'Create Raid',
-        fields: [
-            { id: 'raidName',    label: 'Raid Name',       placeholder: 'e.g. Friday Night Raid',  style: TextInputStyle.Short, required: true },
-            { id: 'startTime',   label: 'Start Timestamp', placeholder: 'e.g. <t:1700000000:F>',   style: TextInputStyle.Short, required: true },
-            { id: 'endTime',     label: 'End Timestamp',   placeholder: 'e.g. <t:1700003600:F>',   style: TextInputStyle.Short, required: true },
-            { id: 'roleName',    label: 'Role Name',       placeholder: 'e.g. Friday Raiders',     style: TextInputStyle.Short, required: true },
-        ]
-    },
-    {
-        id: 'editst',
-        label: 'Edit Start Time',
-        emoji: '🕐',
-        style: ButtonStyle.Primary,
-        modalTitle: 'Edit Start Time',
-        fields: [
-            { id: 'raidId',       label: 'Raid ID',         placeholder: 'The 10-digit raid ID',   style: TextInputStyle.Short, required: true },
-            { id: 'newTimestamp', label: 'New Start Time',  placeholder: 'e.g. <t:1700000000:F>',  style: TextInputStyle.Short, required: true },
-        ]
-    },
-    {
-        id: 'editet',
-        label: 'Edit End Time',
-        emoji: '🕙',
-        style: ButtonStyle.Primary,
-        modalTitle: 'Edit End Time',
-        fields: [
-            { id: 'raidId',       label: 'Raid ID',         placeholder: 'The 10-digit raid ID',   style: TextInputStyle.Short, required: true },
-            { id: 'newTimestamp', label: 'New End Time',    placeholder: 'e.g. <t:1700003600:F>',  style: TextInputStyle.Short, required: true },
-        ]
-    },
-];
 
 function loadRaidMessages() {
     if (fs.existsSync(DATA_FILE)) {
@@ -120,8 +85,8 @@ function buildConsoleModal() {
     const input = new TextInputBuilder()
         .setCustomId('console_input')
         .setLabel('type a command')
-        .setPlaceholder('e.g. raidsetup, Raid Name, <t:...>, <t:...>, Role Name')
-        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('raidsetup | editst | editet')
+        .setStyle(TextInputStyle.Paragraph)
         .setRequired(true);
 
     modal.addComponents(new ActionRowBuilder().addComponents(input));
@@ -210,6 +175,33 @@ function buildHelpEmbed() {
         );
 }
 
+// Parse console input — splits on first space only for editst/editet,
+// and on first 3 spaces for raidsetup to preserve timestamps
+function parseConsoleInput(raw) {
+    const parts = raw.trim().split(/\s+/);
+    const cmd = parts[0].toLowerCase();
+
+    if (cmd === 'raidsetup') {
+        // Format: raidsetup "Raid Name" startTimestamp endTimestamp roleName
+        // We split into exactly 5 parts: cmd, name, start, end, role
+        // Everything after the cmd is re-joined and split by | delimiter
+        const rest = raw.trim().slice('raidsetup'.length).trim();
+        const fields = rest.split('|').map(s => s.trim());
+        if (fields.length < 4) return null;
+        return { cmd, raidName: fields[0], startTime: fields[1], endTime: fields[2], roleName: fields[3] };
+    }
+
+    if (cmd === 'editst' || cmd === 'editet') {
+        // Format: editst raidId timestamp
+        const raidId = parts[1];
+        const timestamp = parts.slice(2).join(' ');
+        if (!raidId || !timestamp) return null;
+        return { cmd, raidId, timestamp };
+    }
+
+    return { cmd };
+}
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -245,12 +237,10 @@ client.on(Events.MessageCreate, async message => {
 
     if (!KNOWN_COMMANDS.includes(command)) return;
 
-    // ;console — checked first, before any role gate
+    // ;console — console users only, before any role gate
     if (command === 'console') {
         if (!CONSOLE_ALLOWED_USERS.includes(message.author.id)) return;
-
         try { await message.delete(); } catch (_) {}
-
         const consoleChannel = await client.channels.fetch(CONSOLE_CHANNEL_ID);
         await consoleChannel.send({
             embeds: [
@@ -261,17 +251,14 @@ client.on(Events.MessageCreate, async message => {
             ],
             components: [buildConsoleButton()],
         });
-
         return;
     }
 
-    // ;raidban — checked before role gate, has its own permission check
+    // ;raidban — its own permission check, before general role gate
     if (command === 'raidban') {
         if (!hasRaidBanPermission(message.member)) return;
 
         const args = fullContent.slice('raidban'.length).trim();
-
-        // Accept both a mention (<@id>) and a raw user ID
         const mentionMatch = args.match(/^<@!?(\d+)>/);
         const idMatch = args.match(/^(\d+)/);
         let targetId, remainingText;
@@ -286,7 +273,7 @@ client.on(Events.MessageCreate, async message => {
             return message.reply('Usage: `;raidban <@user or user ID> [reason]`');
         }
 
-        const reason = remainingText || '*no reason given*';
+        const reason = remainingText || 'no reason given';
 
         let targetMember;
         try {
@@ -297,17 +284,13 @@ client.on(Events.MessageCreate, async message => {
 
         try {
             await targetMember.roles.add(RAIDBAN_ROLE_ID);
-
             const issuerName = message.author.username;
             const targetName = targetMember.user.username;
-
             const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
             await logChannel.send(
                 `✅ **${issuerName}** raid-banned **${targetName} (${targetId})**\n` +
-                `**Reason:** ${reason}`
+                `Reason: *${reason}*`
             );
-
-            await message.reply(`✅ **${targetName}** has been raid-banned.`);
         } catch (error) {
             console.error(error);
             await message.reply('❌ Failed to apply raid-ban role.');
@@ -316,7 +299,7 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
-    // Remaining commands require an allowed role
+    // All remaining commands require an allowed role
     if (!hasPermission(message.member)) return;
 
     // ;help
@@ -373,35 +356,42 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.deferReply({ ephemeral: true });
 
         const raw = interaction.fields.getTextInputValue('console_input').trim();
-        const parts = raw.split(',').map(s => s.trim());
-        const cmd = parts[0].toLowerCase();
+        const parsed = parseConsoleInput(raw);
+
+        if (!parsed) {
+            return interaction.editReply('❌ Could not parse command. Check your formatting.');
+        }
+
+        const { cmd } = parsed;
 
         if (cmd === 'raidsetup') {
-            if (parts.length < 5) {
-                return interaction.editReply('❌ Usage: `raidsetup, Raid Name, Start Timestamp, End Timestamp, Role Name`');
+            if (!parsed.raidName || !parsed.startTime || !parsed.endTime || !parsed.roleName) {
+                return interaction.editReply(
+                    '❌ Usage:\n`raidsetup Raid Name | <t:timestamp:F> | <t:timestamp:F> | Role Name`'
+                );
             }
             await handleRaidSetup(interaction, {
-                raidName:  parts[1],
-                startTime: parts[2],
-                endTime:   parts[3],
-                roleName:  parts[4]
+                raidName:  parsed.raidName,
+                startTime: parsed.startTime,
+                endTime:   parsed.endTime,
+                roleName:  parsed.roleName
             });
             return;
         }
 
         if (cmd === 'editst') {
-            if (parts.length < 3) {
-                return interaction.editReply('❌ Usage: `editst, raid id, new timestamp`');
+            if (!parsed.raidId || !parsed.timestamp) {
+                return interaction.editReply('❌ Usage: `editst <raid id> <timestamp>`');
             }
-            await handleEditStartTime(interaction, parts[1], parts[2]);
+            await handleEditStartTime(interaction, parsed.raidId, parsed.timestamp);
             return;
         }
 
         if (cmd === 'editet') {
-            if (parts.length < 3) {
-                return interaction.editReply('❌ Usage: `editet, raid id, new timestamp`');
+            if (!parsed.raidId || !parsed.timestamp) {
+                return interaction.editReply('❌ Usage: `editet <raid id> <timestamp>`');
             }
-            await handleEditEndTime(interaction, parts[1], parts[2]);
+            await handleEditEndTime(interaction, parsed.raidId, parsed.timestamp);
             return;
         }
 
