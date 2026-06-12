@@ -793,5 +793,5 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
         console.error(error);
     }
 });
-
+// hi bob
 client.login(process.env.TOKEN);
