@@ -10,11 +10,13 @@ const {
     ButtonStyle,
     ModalBuilder,
     TextInputBuilder,
-    TextInputStyle
+    TextInputStyle,
+    AuditLogEvent
 } = require('discord.js');
 const fs = require('fs');
 
 const DATA_FILE = './raidMessages.json';
+const MOD_LOG_FILE = './modLogs.json';
 const RAID_CHANNEL_ID = '1386132453017518272';
 const SUCCESS_CHANNEL_ID = '1490125476671520939';
 const CONSOLE_CHANNEL_ID = '1490491292101251144';
@@ -35,22 +37,58 @@ const ALLOWED_ROLES = [
     '1386139144971096115'
 ];
 
-// Users who bypass the role check entirely for all commands
 const SUPERUSERS = [
     '477575548944777226',
     '1041158415713583185'
 ];
 
 const RAIDBAN_ALLOWED_ROLES = [
-    '1310373664998555701'
+    '1310373664998555701',
+    '1418316070560731339',
+    '1041158415713583185'
 ];
 const RAIDBAN_ALLOWED_USERS = [
     '477575548944777226',
     '1041158415713583185'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban'];
+const VIEW_ALLOWED_ROLES = [
+    '1386463199355736114',
+    '1418316070560731339',
+    '1491522983016140921'
+];
+const VIEW_ALLOWED_USERS = [
+    '477575548944777226'
+];
 
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view'];
+
+// ─── Mod log storage ──────────────────────────────────────────────────────────
+function loadModLogs() {
+    if (fs.existsSync(MOD_LOG_FILE)) {
+        return JSON.parse(fs.readFileSync(MOD_LOG_FILE, 'utf8'));
+    }
+    return {};
+}
+
+function saveModLogs(logs) {
+    fs.writeFileSync(MOD_LOG_FILE, JSON.stringify(logs, null, 2));
+}
+
+function addModLog(userId, type, date = new Date().toISOString()) {
+    const logs = loadModLogs();
+    if (!logs[userId]) logs[userId] = { bans: [], mutes: [], kicks: [], warns: [], raidbans: [], unraidbans: [] };
+    if (!logs[userId][type]) logs[userId][type] = [];
+    logs[userId][type].push(date);
+    saveModLogs(logs);
+}
+
+function getUserLogs(userId) {
+    const logs = loadModLogs();
+    return logs[userId] || { bans: [], mutes: [], kicks: [], warns: [], raidbans: [], unraidbans: [] };
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function loadRaidMessages() {
     if (fs.existsSync(DATA_FILE)) {
         const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
@@ -79,6 +117,16 @@ function hasPermission(member) {
 function hasRaidBanPermission(member) {
     return RAIDBAN_ALLOWED_USERS.includes(member.user.id) ||
         RAIDBAN_ALLOWED_ROLES.some(id => member.roles.cache.has(id));
+}
+
+function hasViewPermission(member) {
+    return VIEW_ALLOWED_USERS.includes(member.user.id) ||
+        VIEW_ALLOWED_ROLES.some(id => member.roles.cache.has(id));
+}
+
+function formatDates(dates) {
+    if (!dates || dates.length === 0) return 'none';
+    return dates.map(d => `<t:${Math.floor(new Date(d).getTime() / 1000)}:D>`).join(', ');
 }
 
 function buildConsoleModal() {
@@ -132,9 +180,6 @@ function buildHelpEmbed() {
                 value: [
                     '**Description:** Edits the start time of an existing raid post.',
                     '**Usage:** `;editst <Raid ID> <New Timestamp>`',
-                    '**Fields:**',
-                    '› `Raid ID` — the 10-digit ID returned when the raid was created',
-                    '› `New Timestamp` — Discord timestamp e.g. `<t:1700000000:F>`',
                     '**Who can use:** Members with an allowed staff role',
                 ].join('\n'),
             },
@@ -143,20 +188,14 @@ function buildHelpEmbed() {
                 value: [
                     '**Description:** Edits the end time of an existing raid post.',
                     '**Usage:** `;editet <Raid ID> <New Timestamp>`',
-                    '**Fields:**',
-                    '› `Raid ID` — the 10-digit ID returned when the raid was created',
-                    '› `New Timestamp` — Discord timestamp e.g. `<t:1700003600:F>`',
                     '**Who can use:** Members with an allowed staff role',
                 ].join('\n'),
             },
             {
                 name: '🔨  ;raidban',
                 value: [
-                    '**Description:** Permanently assigns the raid-ban role to a user and logs the action.',
+                    '**Description:** Assigns the raid-ban role to a user and logs the action.',
                     '**Usage:** `;raidban <@user or user ID> [reason]`',
-                    '**Fields:**',
-                    '› `@user or user ID` — mention or paste the user\'s ID',
-                    '› `reason` — optional reason (shows *no reason given* if omitted)',
                     '**Who can use:** Senior staff roles and server owners',
                 ].join('\n'),
             },
@@ -164,11 +203,16 @@ function buildHelpEmbed() {
                 name: '🔓  ;unraidban',
                 value: [
                     '**Description:** Removes the raid-ban role from a user and logs the action.',
-                    '**Usage:** `;unraidban <@user or user ID> [reason]`',
-                    '**Fields:**',
-                    '› `@user or user ID` — mention or paste the user\'s ID',
-                    '› `reason` — optional reason (shows *no reason given* if omitted)',
+                    '**Usage:** `;unraidban <@user or user ID>`',
                     '**Who can use:** Senior staff roles and server owners',
+                ].join('\n'),
+            },
+            {
+                name: '📋  ;view',
+                value: [
+                    '**Description:** Generates a moderation log for a user.',
+                    '**Usage:** `;view <@user or user ID>`',
+                    '**Who can use:** Staff roles',
                 ].join('\n'),
             },
             {
@@ -208,8 +252,8 @@ function parseConsoleInput(raw) {
         return { cmd, raidId, timestamp };
     }
 
-    if (cmd === 'raidban' || cmd === 'unraidban') {
-        const rest = raw.trim().slice(cmd.length).trim();
+    if (cmd === 'raidban') {
+        const rest = raw.trim().slice('raidban'.length).trim();
         const mentionMatch = rest.match(/^<@!?(\d+)>/);
         const idMatch = rest.match(/^(\d+)/);
         let targetId, reason;
@@ -219,22 +263,108 @@ function parseConsoleInput(raw) {
         } else if (idMatch) {
             targetId = idMatch[1];
             reason = rest.slice(idMatch[0].length).trim() || 'no reason given';
-        } else {
-            return null;
-        }
+        } else return null;
         return { cmd, targetId, reason };
+    }
+
+    if (cmd === 'unraidban') {
+        const rest = raw.trim().slice('unraidban'.length).trim();
+        const mentionMatch = rest.match(/^<@!?(\d+)>/);
+        const idMatch = rest.match(/^(\d+)/);
+        let targetId;
+        if (mentionMatch) targetId = mentionMatch[1];
+        else if (idMatch) targetId = idMatch[1];
+        else return null;
+        return { cmd, targetId };
+    }
+
+    if (cmd === 'view') {
+        const rest = raw.trim().slice('view'.length).trim();
+        const mentionMatch = rest.match(/^<@!?(\d+)>/);
+        const idMatch = rest.match(/^(\d+)/);
+        let targetId;
+        if (mentionMatch) targetId = mentionMatch[1];
+        else if (idMatch) targetId = idMatch[1];
+        else return null;
+        return { cmd, targetId };
     }
 
     return { cmd };
 }
 
+async function buildViewEmbed(guild, targetId) {
+    let member, user;
+    try {
+        member = await guild.members.fetch(targetId);
+        user = member.user;
+    } catch {
+        return null;
+    }
+
+    // Pull from our own logs
+    const stored = getUserLogs(targetId);
+
+    // Pull from Discord audit log
+    const auditBans = [];
+    const auditKicks = [];
+    try {
+        const banLogs = await guild.fetchAuditLogs({ type: AuditLogEvent.MemberBanAdd, limit: 100 });
+        for (const entry of banLogs.entries.values()) {
+            if (entry.target?.id === targetId) {
+                auditBans.push(entry.createdAt.toISOString());
+            }
+        }
+        const kickLogs = await guild.fetchAuditLogs({ type: AuditLogEvent.MemberKick, limit: 100 });
+        for (const entry of kickLogs.entries.values()) {
+            if (entry.target?.id === targetId) {
+                auditKicks.push(entry.createdAt.toISOString());
+            }
+        }
+    } catch (_) {}
+
+    // Merge audit log + stored, deduplicate by date proximity
+    const allBans = [...new Set([...stored.bans, ...auditBans])].sort();
+    const allKicks = [...new Set([...stored.kicks, ...auditKicks])].sort();
+    const allMutes = [...(stored.mutes || [])].sort();
+    const allWarns = [...(stored.warns || [])].sort();
+    const allRaidbans = [...(stored.raidbans || [])].sort();
+
+    const roles = member.roles.cache
+        .filter(r => r.id !== guild.id)
+        .sort((a, b) => b.position - a.position)
+        .map(r => `<@&${r.id}>`)
+        .join(', ') || 'none';
+
+    const joinDate = member.joinedAt
+        ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>`
+        : 'Unknown';
+
+    return new EmbedBuilder()
+        .setTitle(`Moderation Log — ${user.username}`)
+        .setThumbnail(user.displayAvatarURL())
+        .setColor(0xB9B4FF)
+        .setFooter({ text: `User ID: ${targetId}` })
+        .setTimestamp()
+        .addFields(
+            { name: 'Joined', value: joinDate, inline: true },
+            { name: 'Roles', value: roles },
+            { name: `Bans (${allBans.length})`, value: formatDates(allBans) },
+            { name: `Mutes (${allMutes.length})`, value: formatDates(allMutes) },
+            { name: `Kicks (${allKicks.length})`, value: formatDates(allKicks) },
+            { name: `Warns (${allWarns.length})`, value: formatDates(allWarns) },
+            { name: `Raid Bans (${allRaidbans.length})`, value: formatDates(allRaidbans) },
+        );
+}
+
+// ─── Client ───────────────────────────────────────────────────────────────────
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.GuildMessageReactions,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildModeration
     ],
     partials: [
         Partials.Message,
@@ -254,6 +384,30 @@ client.once(Events.ClientReady, () => {
     console.log(`ECR Console online as ${client.user.tag}`);
 });
 
+// ─── Auto-log bans and kicks from audit log ───────────────────────────────────
+client.on(Events.GuildBanAdd, async ban => {
+    try {
+        await new Promise(r => setTimeout(r, 1000));
+        const logs = await ban.guild.fetchAuditLogs({ type: AuditLogEvent.MemberBanAdd, limit: 1 });
+        const entry = logs.entries.first();
+        if (entry?.target?.id === ban.user.id) {
+            addModLog(ban.user.id, 'bans');
+        }
+    } catch (_) {}
+});
+
+client.on(Events.GuildMemberRemove, async member => {
+    try {
+        await new Promise(r => setTimeout(r, 1000));
+        const logs = await member.guild.fetchAuditLogs({ type: AuditLogEvent.MemberKick, limit: 1 });
+        const entry = logs.entries.first();
+        if (entry?.target?.id === member.id && Date.now() - entry.createdTimestamp < 5000) {
+            addModLog(member.id, 'kicks');
+        }
+    } catch (_) {}
+});
+
+// ─── Message handler ──────────────────────────────────────────────────────────
 client.on(Events.MessageCreate, async message => {
     if (message.author.bot) return;
     if (!message.content.startsWith(PREFIX)) return;
@@ -263,7 +417,7 @@ client.on(Events.MessageCreate, async message => {
 
     if (!KNOWN_COMMANDS.includes(command)) return;
 
-    // ;console — console users only
+    // ;console
     if (command === 'console') {
         if (!CONSOLE_ALLOWED_USERS.includes(message.author.id)) return;
         try { await message.delete(); } catch (_) {}
@@ -280,7 +434,7 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
-    // ;raidban — own permission check
+    // ;raidban
     if (command === 'raidban') {
         if (!hasRaidBanPermission(message.member)) return;
         const args = fullContent.slice('raidban'.length).trim();
@@ -305,6 +459,7 @@ client.on(Events.MessageCreate, async message => {
         }
         try {
             await targetMember.roles.add(RAIDBAN_ROLE_ID);
+            addModLog(targetId, 'raidbans');
             const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
             await logChannel.send(
                 `✅ **${message.author.username}** raid-banned **${targetMember.user.username} (${targetId})**\n` +
@@ -317,23 +472,16 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
-    // ;unraidban — same permission as raidban
+    // ;unraidban
     if (command === 'unraidban') {
         if (!hasRaidBanPermission(message.member)) return;
         const args = fullContent.slice('unraidban'.length).trim();
         const mentionMatch = args.match(/^<@!?(\d+)>/);
         const idMatch = args.match(/^(\d+)/);
-        let targetId, remainingText;
-        if (mentionMatch) {
-            targetId = mentionMatch[1];
-            remainingText = args.slice(mentionMatch[0].length).trim();
-        } else if (idMatch) {
-            targetId = idMatch[1];
-            remainingText = args.slice(idMatch[0].length).trim();
-        } else {
-            return message.reply('Usage: `;unraidban <@user or user ID> [reason]`');
-        }
-        const reason = remainingText || 'no reason given';
+        let targetId;
+        if (mentionMatch) targetId = mentionMatch[1];
+        else if (idMatch) targetId = idMatch[1];
+        else return message.reply('Usage: `;unraidban <@user or user ID>`');
         let targetMember;
         try {
             targetMember = await message.guild.members.fetch(targetId);
@@ -344,8 +492,7 @@ client.on(Events.MessageCreate, async message => {
             await targetMember.roles.remove(RAIDBAN_ROLE_ID);
             const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
             await logChannel.send(
-                `✅ **${message.author.username}** removed the raid-ban from **${targetMember.user.username} (${targetId})**\n` +
-                `Reason: *${reason}*`
+                `✅ **${message.author.username}** unraid-banned **${targetMember.user.username} (${targetId})**`
             );
         } catch (error) {
             console.error(error);
@@ -354,7 +501,23 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
-    // All remaining commands — role check with superuser bypass
+    // ;view
+    if (command === 'view') {
+        if (!hasViewPermission(message.member)) return;
+        const args = fullContent.slice('view'.length).trim();
+        const mentionMatch = args.match(/^<@!?(\d+)>/);
+        const idMatch = args.match(/^(\d+)/);
+        let targetId;
+        if (mentionMatch) targetId = mentionMatch[1];
+        else if (idMatch) targetId = idMatch[1];
+        else return message.reply('Usage: `;view <@user or user ID>`');
+        const embed = await buildViewEmbed(message.guild, targetId);
+        if (!embed) return message.reply('❌ Could not find that user in this server.');
+        await message.channel.send({ embeds: [embed] });
+        return;
+    }
+
+    // Role-gated commands
     if (!hasPermission(message.member)) return;
 
     if (command === 'help') {
@@ -389,6 +552,7 @@ client.on(Events.MessageCreate, async message => {
     }
 });
 
+// ─── Interaction handler ──────────────────────────────────────────────────────
 client.on(Events.InteractionCreate, async interaction => {
 
     if (interaction.isButton() && interaction.customId === 'console_open') {
@@ -429,33 +593,25 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         if (cmd === 'editst') {
-            if (!parsed.raidId || !parsed.timestamp) {
-                return interaction.editReply('❌ Usage: `editst <raid id> <timestamp>`');
-            }
+            if (!parsed.raidId || !parsed.timestamp) return interaction.editReply('❌ Usage: `editst <raid id> <timestamp>`');
             await handleEditStartTime(interaction, parsed.raidId, parsed.timestamp);
             return;
         }
 
         if (cmd === 'editet') {
-            if (!parsed.raidId || !parsed.timestamp) {
-                return interaction.editReply('❌ Usage: `editet <raid id> <timestamp>`');
-            }
+            if (!parsed.raidId || !parsed.timestamp) return interaction.editReply('❌ Usage: `editet <raid id> <timestamp>`');
             await handleEditEndTime(interaction, parsed.raidId, parsed.timestamp);
             return;
         }
 
         if (cmd === 'raidban') {
-            if (!parsed.targetId) {
-                return interaction.editReply('❌ Usage: `raidban <user ID> [reason]`');
-            }
+            if (!parsed.targetId) return interaction.editReply('❌ Usage: `raidban <user ID> [reason]`');
             let targetMember;
-            try {
-                targetMember = await interaction.guild.members.fetch(parsed.targetId);
-            } catch {
-                return interaction.editReply('❌ Could not find that user in this server.');
-            }
+            try { targetMember = await interaction.guild.members.fetch(parsed.targetId); }
+            catch { return interaction.editReply('❌ Could not find that user.'); }
             try {
                 await targetMember.roles.add(RAIDBAN_ROLE_ID);
+                addModLog(parsed.targetId, 'raidbans');
                 const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
                 await logChannel.send(
                     `✅ **${interaction.user.username}** raid-banned **${targetMember.user.username} (${parsed.targetId})**\n` +
@@ -469,27 +625,28 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         if (cmd === 'unraidban') {
-            if (!parsed.targetId) {
-                return interaction.editReply('❌ Usage: `unraidban <user ID> [reason]`');
-            }
+            if (!parsed.targetId) return interaction.editReply('❌ Usage: `unraidban <user ID>`');
             let targetMember;
-            try {
-                targetMember = await interaction.guild.members.fetch(parsed.targetId);
-            } catch {
-                return interaction.editReply('❌ Could not find that user in this server.');
-            }
+            try { targetMember = await interaction.guild.members.fetch(parsed.targetId); }
+            catch { return interaction.editReply('❌ Could not find that user.'); }
             try {
                 await targetMember.roles.remove(RAIDBAN_ROLE_ID);
                 const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
                 await logChannel.send(
-                    `✅ **${interaction.user.username}** removed the raid-ban from **${targetMember.user.username} (${parsed.targetId})**\n` +
-                    `Reason: *${parsed.reason}*`
+                    `✅ **${interaction.user.username}** unraid-banned **${targetMember.user.username} (${parsed.targetId})**`
                 );
                 return interaction.editReply(`✅ Raid-ban removed from **${targetMember.user.username}**.`);
             } catch (error) {
                 console.error(error);
                 return interaction.editReply('❌ Failed to remove raid-ban role.');
             }
+        }
+
+        if (cmd === 'view') {
+            if (!parsed.targetId) return interaction.editReply('❌ Usage: `view <user ID>`');
+            const embed = await buildViewEmbed(interaction.guild, parsed.targetId);
+            if (!embed) return interaction.editReply('❌ Could not find that user.');
+            return interaction.editReply({ embeds: [embed] });
         }
 
         if (cmd === 'help') {
@@ -500,6 +657,7 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 });
 
+// ─── Command handlers ─────────────────────────────────────────────────────────
 async function reply(ctx, content) {
     if (ctx.isModalSubmit?.() || ctx.isButton?.()) {
         if (ctx.deferred) return ctx.editReply(typeof content === 'string' ? { content } : content);
@@ -555,16 +713,13 @@ async function handleRaidSetup(ctx, { raidName, startTime, endTime, roleName }) 
 async function handleEditStartTime(ctx, raidId, newTimestamp) {
     const messageId = raidIds.get(raidId);
     if (!messageId) return reply(ctx, '❌ No raid found with that ID.');
-
     const data = raidMessages.get(messageId);
     try {
         const raidChannel = await client.channels.fetch(RAID_CHANNEL_ID);
         const raidMessage = await raidChannel.messages.fetch(messageId);
-
         data.startTime = newTimestamp;
         raidMessages.set(messageId, data);
         saveRaidMessages(raidMessages);
-
         const updatedEmbed = new EmbedBuilder()
             .setDescription(
                 `# **${data.raidName}**\n\n` +
@@ -575,7 +730,6 @@ async function handleEditStartTime(ctx, raidId, newTimestamp) {
             .setColor(0xff0000)
             .setFooter({ text: 'ECR Console' })
             .setTimestamp();
-
         await raidMessage.edit({ embeds: [updatedEmbed] });
         await reply(ctx, `✅ Start time updated for raid **${data.raidName}**.`);
     } catch (error) {
@@ -587,16 +741,13 @@ async function handleEditStartTime(ctx, raidId, newTimestamp) {
 async function handleEditEndTime(ctx, raidId, newTimestamp) {
     const messageId = raidIds.get(raidId);
     if (!messageId) return reply(ctx, '❌ No raid found with that ID.');
-
     const data = raidMessages.get(messageId);
     try {
         const raidChannel = await client.channels.fetch(RAID_CHANNEL_ID);
         const raidMessage = await raidChannel.messages.fetch(messageId);
-
         data.endTime = newTimestamp;
         raidMessages.set(messageId, data);
         saveRaidMessages(raidMessages);
-
         const updatedEmbed = new EmbedBuilder()
             .setDescription(
                 `# **${data.raidName}**\n\n` +
@@ -607,7 +758,6 @@ async function handleEditEndTime(ctx, raidId, newTimestamp) {
             .setColor(0xff0000)
             .setFooter({ text: 'ECR Console' })
             .setTimestamp();
-
         await raidMessage.edit({ embeds: [updatedEmbed] });
         await reply(ctx, `✅ End time updated for raid **${data.raidName}**.`);
     } catch (error) {
