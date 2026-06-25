@@ -24,7 +24,7 @@ const RAIDBAN_LOG_CHANNEL_ID = '1490125476671520939';
 const RAIDBAN_ROLE_ID = '1482487254814294170';
 const TEMPRAIDBAN_MEMORY_CHANNEL_ID = '1519798660001435679';
 const TOWER_MEMORY_CHANNEL_ID = '1519811705977442345';
-const TOWER_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
+const TOWER_COOLDOWN_MS = 1 * 60 * 60 * 1000; // 1 hour
 const TOWER_COOLDOWN_BYPASS = ['1154253852476973086'];
 const PREFIX = ';';
 
@@ -65,7 +65,7 @@ const VIEW_ALLOWED_USERS = [
     '477575548944777226'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'tower', 'toer', 'lb'];
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'tower', 'toer', 'lb', 'stats'];
 
 const TOWERS = [
   { rank: 1, name: 'S.T.O.N.E Facility: Reborn', pts: 1000.0 },
@@ -2726,6 +2726,11 @@ async function handleTowerRoll(message) {
         data.scores[userId].pts = Math.round((data.scores[userId].pts + tower.pts) * 100) / 100;
         data.scores[userId].username = username;
 
+        // Track per-tower roll counts
+        if (!data.rolls) data.rolls = {};
+        if (!data.rolls[userId]) data.rolls[userId] = {};
+        data.rolls[userId][tower.name] = (data.rolls[userId][tower.name] || 0) + 1;
+
         // Set cooldown on the roller
         if (!bypassCooldown) {
             data.cooldowns[message.author.id] = Date.now() + TOWER_COOLDOWN_MS;
@@ -2770,6 +2775,70 @@ async function handleLeaderboard(message) {
             .setTimestamp();
 
         await message.channel.send({ embeds: [embed] });
+    });
+}
+
+async function handleStats(message) {
+    const mention = message.mentions.users.first();
+    const targetUser = mention ?? message.author;
+    const userId = targetUser.id;
+
+    await enqueueTowerTask(async () => {
+        const data = await loadTowerMemory();
+        const scores = data.scores || {};
+        const rolls = data.rolls || {};
+
+        const userScore = scores[userId];
+        const userRolls = rolls[userId] || {};
+        const displayName = userScore?.username ?? targetUser.username;
+
+        const totalRolls = Object.values(userRolls).reduce((a, b) => a + b, 0);
+        const totalPts = userScore ? Math.round(userScore.pts * 100) / 100 : 0;
+
+        if (totalRolls === 0) {
+            await message.channel.send(
+                `**${displayName}** hasn't rolled any towers yet!`
+            );
+            return;
+        }
+
+        // Sort towers by roll count descending
+        const sorted = Object.entries(userRolls).sort(([, a], [, b]) => b - a);
+
+        // Split into pages of 20 towers if there are many
+        const PAGE_SIZE = 20;
+        const lines = sorted.map(([name, count]) => `**${name}** — rolled **${count}**x`);
+
+        // Build description in chunks to respect Discord's 4096 char embed limit
+        const chunks = [];
+        let current = '';
+        for (const line of lines) {
+            if ((current + '\n' + line).length > 3800) {
+                chunks.push(current);
+                current = line;
+            } else {
+                current = current ? current + '\n' + line : line;
+            }
+        }
+        if (current) chunks.push(current);
+
+        const embed = new EmbedBuilder()
+            .setTitle(`Tower Stats — ${displayName}`)
+            .setDescription(chunks[0])
+            .setColor(0xB9B4FF)
+            .setFooter({ text: `Total rolls: ${totalRolls} • Total pts: ${totalPts}` })
+            .setTimestamp();
+
+        await message.channel.send({ embeds: [embed] });
+
+        // Send overflow pages as follow-up embeds
+        for (let i = 1; i < chunks.length; i++) {
+            const overflow = new EmbedBuilder()
+                .setDescription(chunks[i])
+                .setColor(0xB9B4FF)
+                .setFooter({ text: `Page ${i + 1}` });
+            await message.channel.send({ embeds: [overflow] });
+        }
     });
 }
 
@@ -3405,6 +3474,11 @@ client.on(Events.MessageCreate, async message => {
 
     if (rawTrim === ';lb') {
         await handleLeaderboard(message);
+        return;
+    }
+
+    if (rawTrim === ';stats' || rawTrim.startsWith(';stats ')) {
+        await handleStats(message);
         return;
     }
 
