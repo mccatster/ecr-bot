@@ -2611,6 +2611,12 @@ const TOWERS = [
 let towerMemoryMessageId = null;
 let towerMemoryWriteLock = Promise.resolve();
 
+function enqueueTowerTask(fn) {
+    const next = towerMemoryWriteLock.then(fn);
+    towerMemoryWriteLock = next.catch(() => {});
+    return next;
+}
+
 async function fetchTowerMemoryChannel() {
     return await client.channels.fetch(TOWER_MEMORY_CHANNEL_ID);
 }
@@ -2694,7 +2700,7 @@ async function handleTowerRoll(message) {
     const username = targetUser.username;
     const bypassCooldown = TOWER_COOLDOWN_BYPASS.includes(message.author.id);
 
-    towerMemoryWriteLock = towerMemoryWriteLock.then(async () => {
+    await enqueueTowerTask(async () => {
         const data = await loadTowerMemory();
         if (!data.scores) data.scores = {};
         if (!data.cooldowns) data.cooldowns = {};
@@ -2733,12 +2739,10 @@ async function handleTowerRoll(message) {
 -# Top #${tower.rank}`
         );
     });
-
-    await towerMemoryWriteLock;
 }
 
 async function handleLeaderboard(message) {
-    towerMemoryWriteLock = towerMemoryWriteLock.then(async () => {
+    await enqueueTowerTask(async () => {
         const data = await loadTowerMemory();
         const scores = data.scores || {};
 
@@ -2767,8 +2771,6 @@ async function handleLeaderboard(message) {
 
         await message.channel.send({ embeds: [embed] });
     });
-
-    await towerMemoryWriteLock;
 }
 
 // ─── Duration parser ──────────────────────────────────────────────────────────
