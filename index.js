@@ -22,6 +22,7 @@ const SUCCESS_CHANNEL_ID = '1490125476671520939';
 const CONSOLE_CHANNEL_ID = '1490491292101251144';
 const RAIDBAN_LOG_CHANNEL_ID = '1490125476671520939';
 const RAIDBAN_ROLE_ID = '1482487254814294170';
+const TEMPRAIDBAN_MEMORY_CHANNEL_ID = '1519798660001435679';
 const PREFIX = ';';
 
 const CONSOLE_ALLOWED_USERS = [
@@ -61,7 +62,158 @@ const VIEW_ALLOWED_USERS = [
     '477575548944777226'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view'];
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban'];
+
+// ─── Duration parser ──────────────────────────────────────────────────────────
+// Parses strings like "1h", "30m", "7d", "2h30m" into milliseconds
+function parseDuration(str) {
+    const regex = /(\d+)\s*([dhms])/gi;
+    let total = 0;
+    let match;
+    while ((match = regex.exec(str)) !== null) {
+        const value = parseInt(match[1]);
+        const unit = match[2].toLowerCase();
+        if (unit === 'd') total += value * 24 * 60 * 60 * 1000;
+        else if (unit === 'h') total += value * 60 * 60 * 1000;
+        else if (unit === 'm') total += value * 60 * 1000;
+        else if (unit === 's') total += value * 1000;
+    }
+    return total > 0 ? total : null;
+}
+
+// Formats ms into a readable string like "2h 30m"
+function formatDuration(ms) {
+    const totalSeconds = Math.floor(ms / 1000);
+    const d = Math.floor(totalSeconds / 86400);
+    const h = Math.floor((totalSeconds % 86400) / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    const s = totalSeconds % 60;
+    const parts = [];
+    if (d) parts.push(`${d}d`);
+    if (h) parts.push(`${h}h`);
+    if (m) parts.push(`${m}m`);
+    if (s && !d && !h) parts.push(`${s}s`);
+    return parts.join(' ') || '0m';
+}
+
+// ─── Temp raidban memory (persisted in Discord channel) ───────────────────────
+// Schema stored as JSON in a single pinned message:
+// { "entries": [ { userId, username, reason, duration, durationMs, expiresAt, bannedBy }, ... ] }
+
+let tempRaidbanMemoryMessageId = null;
+const activeTimers = new Map(); // userId -> timeout handle
+
+async function fetchMemoryChannel() {
+    return await client.channels.fetch(TEMPRAIDBAN_MEMORY_CHANNEL_ID);
+}
+
+async function loadTempRaidbanMemory() {
+    try {
+        const channel = await fetchMemoryChannel();
+        const messages = await channel.messages.fetch({ limit: 10 });
+        const botMessages = messages.filter(m => m.author.id === client.user.id);
+        if (botMessages.size === 0) return [];
+
+        const msg = botMessages.first();
+        tempRaidbanMemoryMessageId = msg.id;
+
+        // Strip code block wrapper if present
+        let raw = msg.content;
+        const codeBlockMatch = raw.match(/```json\s*([\s\S]*?)```/);
+        if (codeBlockMatch) raw = codeBlockMatch[1];
+
+        const data = JSON.parse(raw.trim());
+        return data.entries || [];
+    } catch (err) {
+        console.error('Failed to load temp raidban memory:', err);
+        return [];
+    }
+}
+
+async function saveTempRaidbanMemory(entries) {
+    try {
+        const channel = await fetchMemoryChannel();
+        const content = '```json\n' + JSON.stringify({ entries }, null, 2) + '\n```';
+
+        if (tempRaidbanMemoryMessageId) {
+            try {
+                const msg = await channel.messages.fetch(tempRaidbanMemoryMessageId);
+                await msg.edit(content);
+                return;
+            } catch {
+                // Message deleted or unavailable, fall through to create new
+                tempRaidbanMemoryMessageId = null;
+            }
+        }
+
+        const newMsg = await channel.send(content);
+        tempRaidbanMemoryMessageId = newMsg.id;
+    } catch (err) {
+        console.error('Failed to save temp raidban memory:', err);
+    }
+}
+
+async function addTempRaidbanEntry(entry) {
+    const entries = await loadTempRaidbanMemory();
+    // Remove any existing entry for this user (overwrite)
+    const filtered = entries.filter(e => e.userId !== entry.userId);
+    filtered.push(entry);
+    await saveTempRaidbanMemory(filtered);
+}
+
+async function removeTempRaidbanEntry(userId) {
+    const entries = await loadTempRaidbanMemory();
+    const filtered = entries.filter(e => e.userId !== userId);
+    await saveTempRaidbanMemory(filtered);
+}
+
+async function scheduleTempRaidbanExpiry(guild, entry) {
+    const now = Date.now();
+    const remaining = entry.expiresAt - now;
+
+    if (remaining <= 0) {
+        // Already expired — lift immediately
+        await liftTempRaidban(guild, entry);
+        return;
+    }
+
+    // Clear any existing timer for this user
+    if (activeTimers.has(entry.userId)) {
+        clearTimeout(activeTimers.get(entry.userId));
+    }
+
+    const timer = setTimeout(async () => {
+        activeTimers.delete(entry.userId);
+        try {
+            const freshGuild = client.guilds.cache.first() ?? await client.guilds.fetch(guild.id);
+            await liftTempRaidban(freshGuild, entry);
+        } catch (err) {
+            console.error('Failed to lift temp raidban on expiry:', err);
+        }
+    }, remaining);
+
+    activeTimers.set(entry.userId, timer);
+}
+
+async function liftTempRaidban(guild, entry) {
+    try {
+        const member = await guild.members.fetch(entry.userId);
+        await member.roles.remove(RAIDBAN_ROLE_ID);
+    } catch {
+        // User may have left the server — still clean up the log
+    }
+
+    await removeTempRaidbanEntry(entry.userId);
+
+    try {
+        const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
+        await logChannel.send(
+            `🔓 Temp raid-ban for **${entry.username} (${entry.userId})** has expired and been lifted.`
+        );
+    } catch (err) {
+        console.error('Failed to send expiry log message:', err);
+    }
+}
 
 // ─── Mod log storage ──────────────────────────────────────────────────────────
 function loadModLogs() {
@@ -200,6 +352,15 @@ function buildHelpEmbed() {
                 ].join('\n'),
             },
             {
+                name: '⏱️  ;tempraidban',
+                value: [
+                    '**Description:** Temporarily assigns the raid-ban role to a user, then lifts it automatically.',
+                    '**Usage:** `;tempraidban <@user or user ID> <duration> [reason]`',
+                    '**Duration format:** `1h`, `30m`, `7d`, `2h30m`',
+                    '**Who can use:** Senior staff roles and server owners',
+                ].join('\n'),
+            },
+            {
                 name: '🔓  ;unraidban',
                 value: [
                     '**Description:** Removes the raid-ban role from a user and logs the action.',
@@ -265,6 +426,26 @@ function parseConsoleInput(raw) {
             reason = rest.slice(idMatch[0].length).trim() || 'no reason given';
         } else return null;
         return { cmd, targetId, reason };
+    }
+
+    if (cmd === 'tempraidban') {
+        const rest = raw.trim().slice('tempraidban'.length).trim();
+        const mentionMatch = rest.match(/^<@!?(\d+)>/);
+        const idMatch = rest.match(/^(\d+)/);
+        let targetId, remaining;
+        if (mentionMatch) {
+            targetId = mentionMatch[1];
+            remaining = rest.slice(mentionMatch[0].length).trim();
+        } else if (idMatch) {
+            targetId = idMatch[1];
+            remaining = rest.slice(idMatch[0].length).trim();
+        } else return null;
+        // Next token is duration
+        const durationMatch = remaining.match(/^(\d+[dhms](?:\d+[dhms])*)/i);
+        if (!durationMatch) return null;
+        const durationStr = durationMatch[1];
+        const reason = remaining.slice(durationStr.length).trim() || 'no reason given';
+        return { cmd, targetId, durationStr, reason };
     }
 
     if (cmd === 'unraidban') {
@@ -380,8 +561,23 @@ for (const [messageId, data] of raidMessages.entries()) {
     if (data.raidId) raidIds.set(data.raidId, messageId);
 }
 
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
     console.log(`ECR Console online as ${client.user.tag}`);
+
+    // Restore temp raidban timers from memory channel
+    try {
+        const guild = client.guilds.cache.first();
+        if (!guild) return;
+
+        const entries = await loadTempRaidbanMemory();
+        console.log(`Restoring ${entries.length} temp raidban(s) from memory...`);
+
+        for (const entry of entries) {
+            await scheduleTempRaidbanExpiry(guild, entry);
+        }
+    } catch (err) {
+        console.error('Failed to restore temp raidban timers:', err);
+    }
 });
 
 // ─── Auto-log bans and kicks from audit log ───────────────────────────────────
@@ -406,6 +602,57 @@ client.on(Events.GuildMemberRemove, async member => {
         }
     } catch (_) {}
 });
+
+// ─── Core tempraidban handler ─────────────────────────────────────────────────
+async function handleTempRaidban(ctx, { targetId, durationStr, reason }) {
+    const durationMs = parseDuration(durationStr);
+    if (!durationMs) {
+        return reply(ctx, '❌ Invalid duration. Use formats like `1h`, `30m`, `7d`, `2h30m`.');
+    }
+
+    const guild = ctx.guild;
+    let targetMember;
+    try {
+        targetMember = await guild.members.fetch(targetId);
+    } catch {
+        return reply(ctx, '❌ Could not find that user in this server.');
+    }
+
+    const expiresAt = Date.now() + durationMs;
+    const durationFormatted = formatDuration(durationMs);
+    const expiresTimestamp = Math.floor(expiresAt / 1000);
+    const actorName = ctx.author?.username ?? ctx.user?.username;
+
+    try {
+        await targetMember.roles.add(RAIDBAN_ROLE_ID);
+        addModLog(targetId, 'raidbans');
+
+        const entry = {
+            userId: targetId,
+            username: targetMember.user.username,
+            reason,
+            duration: durationFormatted,
+            durationMs,
+            expiresAt,
+            bannedBy: actorName
+        };
+
+        await addTempRaidbanEntry(entry);
+        await scheduleTempRaidbanExpiry(guild, entry);
+
+        const logChannel = await client.channels.fetch(RAIDBAN_LOG_CHANNEL_ID);
+        await logChannel.send(
+            `✅ **${actorName}** temp raid-banned **${targetMember.user.username} (${targetId})**\n` +
+            `Reason: *${reason}*\n` +
+            `Duration: *${durationFormatted}* (expires <t:${expiresTimestamp}:R>)`
+        );
+
+        await reply(ctx, `✅ **${targetMember.user.username}** has been temp raid-banned for **${durationFormatted}**. Expires <t:${expiresTimestamp}:R>.`);
+    } catch (error) {
+        console.error(error);
+        await reply(ctx, '❌ Failed to apply temp raid-ban.');
+    }
+}
 
 // ─── Message handler ──────────────────────────────────────────────────────────
 client.on(Events.MessageCreate, async message => {
@@ -469,6 +716,32 @@ client.on(Events.MessageCreate, async message => {
             console.error(error);
             await message.reply('❌ Failed to apply raid-ban role.');
         }
+        return;
+    }
+
+    // ;tempraidban
+    if (command === 'tempraidban') {
+        if (!hasRaidBanPermission(message.member)) return;
+        const args = fullContent.slice('tempraidban'.length).trim();
+        const mentionMatch = args.match(/^<@!?(\d+)>/);
+        const idMatch = args.match(/^(\d+)/);
+        let targetId, remaining;
+        if (mentionMatch) {
+            targetId = mentionMatch[1];
+            remaining = args.slice(mentionMatch[0].length).trim();
+        } else if (idMatch) {
+            targetId = idMatch[1];
+            remaining = args.slice(idMatch[0].length).trim();
+        } else {
+            return message.reply('Usage: `;tempraidban <@user or user ID> <duration> [reason]`\nDuration examples: `1h`, `30m`, `7d`, `2h30m`');
+        }
+        const durationMatch = remaining.match(/^(\d+[dhms](?:\d+[dhms])*)/i);
+        if (!durationMatch) {
+            return message.reply('❌ Please provide a valid duration. Examples: `1h`, `30m`, `7d`, `2h30m`');
+        }
+        const durationStr = durationMatch[1];
+        const reason = remaining.slice(durationStr.length).trim() || 'no reason given';
+        await handleTempRaidban(message, { targetId, durationStr, reason });
         return;
     }
 
@@ -622,6 +895,18 @@ client.on(Events.InteractionCreate, async interaction => {
                 console.error(error);
                 return interaction.editReply('❌ Failed to apply raid-ban role.');
             }
+        }
+
+        if (cmd === 'tempraidban') {
+            if (!parsed.targetId || !parsed.durationStr) {
+                return interaction.editReply('❌ Usage: `tempraidban <user ID> <duration> [reason]`\nDuration examples: `1h`, `30m`, `7d`, `2h30m`');
+            }
+            await handleTempRaidban(interaction, {
+                targetId: parsed.targetId,
+                durationStr: parsed.durationStr,
+                reason: parsed.reason
+            });
+            return;
         }
 
         if (cmd === 'unraidban') {
@@ -793,5 +1078,6 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
         console.error(error);
     }
 });
+
 // hi bob
 client.login(process.env.TOKEN);
