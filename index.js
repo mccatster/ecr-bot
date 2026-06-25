@@ -24,6 +24,7 @@ const RAIDBAN_LOG_CHANNEL_ID = '1490125476671520939';
 const RAIDBAN_ROLE_ID = '1482487254814294170';
 const TEMPRAIDBAN_MEMORY_CHANNEL_ID = '1519798660001435679';
 const TOWER_MEMORY_CHANNEL_ID = '1519811705977442345';
+const TOWER_ROLLS_CHANNEL_ID = '1519823488066650273';
 const TOWER_COOLDOWN_MS = 1 * 60 * 60 * 1000; // 1 hour
 const TOWER_COOLDOWN_BYPASS = ['1154253852476973086'];
 const PREFIX = ';';
@@ -65,7 +66,7 @@ const VIEW_ALLOWED_USERS = [
     '477575548944777226'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'tower', 'toer', 'lb', 'stats'];
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban'];
 
 const TOWERS = [
   { rank: 1, name: 'S.T.O.N.E Facility: Reborn', pts: 1000.0 },
@@ -2680,6 +2681,71 @@ async function saveTowerMemory(data) {
     }
 }
 
+// ─── Tower rolls memory (separate channel) ────────────────────────────────────
+let towerRollsMessageId = null;
+
+async function fetchTowerRollsChannel() {
+    return await client.channels.fetch(TOWER_ROLLS_CHANNEL_ID);
+}
+
+async function loadTowerRolls() {
+    try {
+        const channel = await fetchTowerRollsChannel();
+
+        if (towerRollsMessageId) {
+            try {
+                const msg = await channel.messages.fetch(towerRollsMessageId);
+                let raw = msg.content;
+                const m = raw.match(/```json\s*([\s\S]*?)```/);
+                if (m) raw = m[1];
+                return JSON.parse(raw.trim());
+            } catch {
+                towerRollsMessageId = null;
+            }
+        }
+
+        const messages = await channel.messages.fetch({ limit: 50 });
+        const botMessages = messages
+            .filter(m => m.author.id === client.user.id)
+            .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+        if (botMessages.size === 0) return {};
+
+        const msg = botMessages.first();
+        towerRollsMessageId = msg.id;
+
+        let raw = msg.content;
+        const m = raw.match(/```json\s*([\s\S]*?)```/);
+        if (m) raw = m[1];
+        return JSON.parse(raw.trim());
+    } catch (err) {
+        console.error('Failed to load tower rolls memory:', err);
+        return {};
+    }
+}
+
+async function saveTowerRolls(rolls) {
+    try {
+        const channel = await fetchTowerRollsChannel();
+        const content = '```json\n' + JSON.stringify(rolls, null, 2) + '\n```';
+
+        if (towerRollsMessageId) {
+            try {
+                const msg = await channel.messages.fetch(towerRollsMessageId);
+                await msg.edit(content);
+                return;
+            } catch {
+                towerRollsMessageId = null;
+            }
+        }
+
+        const newMsg = await channel.send(content);
+        towerRollsMessageId = newMsg.id;
+    } catch (err) {
+        console.error('Failed to save tower rolls memory:', err);
+    }
+}
+
 function formatTimeRemaining(ms) {
     const totalSeconds = Math.floor(ms / 1000);
     const h = Math.floor(totalSeconds / 3600);
@@ -2726,17 +2792,18 @@ async function handleTowerRoll(message) {
         data.scores[userId].pts = Math.round((data.scores[userId].pts + tower.pts) * 100) / 100;
         data.scores[userId].username = username;
 
-        // Track per-tower roll counts
-        if (!data.rolls) data.rolls = {};
-        if (!data.rolls[userId]) data.rolls[userId] = {};
-        data.rolls[userId][tower.name] = (data.rolls[userId][tower.name] || 0) + 1;
-
         // Set cooldown on the roller
         if (!bypassCooldown) {
             data.cooldowns[message.author.id] = Date.now() + TOWER_COOLDOWN_MS;
         }
 
+        // Save scores/cooldowns, then update rolls in separate channel
         await saveTowerMemory(data);
+
+        const rolls = await loadTowerRolls();
+        if (!rolls[userId]) rolls[userId] = {};
+        rolls[userId][tower.name] = (rolls[userId][tower.name] || 0) + 1;
+        await saveTowerRolls(rolls);
 
         const forLine = mention ? ` for **${username}**` : '';
         await message.channel.send(
@@ -2785,9 +2852,9 @@ async function handleStats(message) {
 
     await enqueueTowerTask(async () => {
         const data = await loadTowerMemory();
-        const scores = data.scores || {};
-        const rolls = data.rolls || {};
+        const rolls = await loadTowerRolls();
 
+        const scores = data.scores || {};
         const userScore = scores[userId];
         const userRolls = rolls[userId] || {};
         const displayName = userScore?.username ?? targetUser.username;
