@@ -2743,6 +2743,7 @@ async function handleLeaderboard(message) {
         const scores = data.scores || {};
 
         const sorted = Object.entries(scores)
+            .filter(([uid]) => uid !== '1154253852476973086')
             .sort(([, a], [, b]) => b.pts - a.pts)
             .slice(0, 15);
 
@@ -3393,7 +3394,9 @@ client.on(Events.MessageCreate, async message => {
 
     // Tower roll commands (no prefix needed — exact match)
     const rawTrim = message.content.trim();
-    if (rawTrim === ';tower' || rawTrim === ';toer' || rawTrim === '[]') {
+    if (rawTrim === ';tower' || rawTrim.startsWith(';tower ') ||
+        rawTrim === ';toer'  || rawTrim.startsWith(';toer ')  ||
+        rawTrim === '[]'     || rawTrim.startsWith('[] ')) {
         await handleTowerRoll(message);
         return;
     }
@@ -3824,5 +3827,5 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
 });
 
 // hi bob
-// shibo is bad at fishing
+// shibo sucks at tower rolling
 client.login(process.env.TOKEN);
