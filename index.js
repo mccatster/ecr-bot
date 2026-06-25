@@ -110,14 +110,33 @@ async function fetchMemoryChannel() {
 async function loadTempRaidbanMemory() {
     try {
         const channel = await fetchMemoryChannel();
-        const messages = await channel.messages.fetch({ limit: 10 });
-        const botMessages = messages.filter(m => m.author.id === client.user.id);
+
+        // If we already know the message ID, fetch it directly
+        if (tempRaidbanMemoryMessageId) {
+            try {
+                const msg = await channel.messages.fetch(tempRaidbanMemoryMessageId);
+                let raw = msg.content;
+                const codeBlockMatch = raw.match(/```json\s*([\s\S]*?)```/);
+                if (codeBlockMatch) raw = codeBlockMatch[1];
+                const data = JSON.parse(raw.trim());
+                return data.entries || [];
+            } catch {
+                // Message gone — fall through to scan
+                tempRaidbanMemoryMessageId = null;
+            }
+        }
+
+        // Scan for oldest bot message (the canonical memory message)
+        const messages = await channel.messages.fetch({ limit: 50 });
+        const botMessages = messages
+            .filter(m => m.author.id === client.user.id)
+            .sort((a, b) => a.createdTimestamp - b.createdTimestamp); // oldest first
+
         if (botMessages.size === 0) return [];
 
         const msg = botMessages.first();
         tempRaidbanMemoryMessageId = msg.id;
 
-        // Strip code block wrapper if present
         let raw = msg.content;
         const codeBlockMatch = raw.match(/```json\s*([\s\S]*?)```/);
         if (codeBlockMatch) raw = codeBlockMatch[1];
@@ -153,18 +172,25 @@ async function saveTempRaidbanMemory(entries) {
     }
 }
 
+let memoryWriteLock = Promise.resolve();
+
 async function addTempRaidbanEntry(entry) {
-    const entries = await loadTempRaidbanMemory();
-    // Remove any existing entry for this user (overwrite)
-    const filtered = entries.filter(e => e.userId !== entry.userId);
-    filtered.push(entry);
-    await saveTempRaidbanMemory(filtered);
+    memoryWriteLock = memoryWriteLock.then(async () => {
+        const entries = await loadTempRaidbanMemory();
+        const filtered = entries.filter(e => e.userId !== entry.userId);
+        filtered.push(entry);
+        await saveTempRaidbanMemory(filtered);
+    });
+    await memoryWriteLock;
 }
 
 async function removeTempRaidbanEntry(userId) {
-    const entries = await loadTempRaidbanMemory();
-    const filtered = entries.filter(e => e.userId !== userId);
-    await saveTempRaidbanMemory(filtered);
+    memoryWriteLock = memoryWriteLock.then(async () => {
+        const entries = await loadTempRaidbanMemory();
+        const filtered = entries.filter(e => e.userId !== userId);
+        await saveTempRaidbanMemory(filtered);
+    });
+    await memoryWriteLock;
 }
 
 async function scheduleTempRaidbanExpiry(guild, entry) {
@@ -646,11 +672,8 @@ async function handleTempRaidban(ctx, { targetId, durationStr, reason }) {
             `Reason: *${reason}*\n` +
             `Duration: *${durationFormatted}* (expires <t:${expiresTimestamp}:R>)`
         );
-
-        await reply(ctx, `✅ **${targetMember.user.username}** has been temp raid-banned for **${durationFormatted}**. Expires <t:${expiresTimestamp}:R>.`);
     } catch (error) {
         console.error(error);
-        await reply(ctx, '❌ Failed to apply temp raid-ban.');
     }
 }
 
@@ -714,7 +737,6 @@ client.on(Events.MessageCreate, async message => {
             );
         } catch (error) {
             console.error(error);
-            await message.reply('❌ Failed to apply raid-ban role.');
         }
         return;
     }
@@ -769,7 +791,6 @@ client.on(Events.MessageCreate, async message => {
             );
         } catch (error) {
             console.error(error);
-            await message.reply('❌ Failed to remove raid-ban role.');
         }
         return;
     }
