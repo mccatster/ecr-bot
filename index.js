@@ -2606,10 +2606,16 @@ const TOWERS = [
 ];
 
 // ─── Tower roll system ────────────────────────────────────────────────────────
-// Memory stored in TOWER_MEMORY_CHANNEL_ID as a single JSON message
+// Memory stored in TOWER_MEMORY_CHANNEL_ID across one or more JSON messages.
+// Large payloads are automatically split across multiple messages when they
+// would exceed Discord's 2000-character limit, and merged back on load.
 // Schema: { scores: { userId: { username, pts } }, cooldowns: { userId: expiresAt } }
 
-let towerMemoryMessageId = null;
+const MSG_CHAR_LIMIT = 1990; // leave a small buffer below Discord's 2000 cap
+const JSON_FENCE_OVERHEAD = '```json\n\n```'.length; // 12 chars
+const MAX_JSON_CHUNK = MSG_CHAR_LIMIT - JSON_FENCE_OVERHEAD; // usable JSON per message
+
+let towerMemoryMessageIds = []; // ordered list of message IDs for the main memory
 let towerMemoryWriteLock = Promise.resolve();
 
 function enqueueTowerTask(fn) {
@@ -2618,71 +2624,126 @@ function enqueueTowerTask(fn) {
     return next;
 }
 
+/**
+ * Split a JSON string into ordered chunks that each fit within MAX_JSON_CHUNK.
+ * We split on newlines where possible to keep valid-looking JSON pieces.
+ */
+function splitJsonIntoChunks(jsonStr) {
+    const chunks = [];
+    let remaining = jsonStr;
+    while (remaining.length > MAX_JSON_CHUNK) {
+        // Find the last newline within the limit so we don't split mid-token
+        let splitAt = remaining.lastIndexOf('\n', MAX_JSON_CHUNK);
+        if (splitAt <= 0) splitAt = MAX_JSON_CHUNK; // no newline found, hard split
+        chunks.push(remaining.slice(0, splitAt));
+        remaining = remaining.slice(splitAt);
+    }
+    chunks.push(remaining);
+    return chunks;
+}
+
+function wrapChunk(chunk, index, total) {
+    // Tag each chunk so we can identify and reassemble them in order
+    return `\`\`\`json\n// chunk:${index}/${total}\n${chunk}\n\`\`\``;
+}
+
+function unwrapChunk(content) {
+    // Strip the fences and optional chunk comment, return raw JSON fragment
+    const m = content.match(/```json\s*(?:\/\/ chunk:\d+\/\d+\s*)?([\s\S]*?)```/);
+    return m ? m[1] : content;
+}
+
 async function fetchTowerMemoryChannel() {
     return await client.channels.fetch(TOWER_MEMORY_CHANNEL_ID);
 }
 
+/**
+ * Load the main tower memory by fetching all known message IDs (or scanning the
+ * channel on first boot), reassembling JSON chunks in order, and parsing.
+ */
 async function loadTowerMemory() {
     try {
         const channel = await fetchTowerMemoryChannel();
 
-        if (towerMemoryMessageId) {
+        // Fast path: we already know which messages hold the data
+        if (towerMemoryMessageIds.length > 0) {
             try {
-                const msg = await channel.messages.fetch(towerMemoryMessageId);
-                let raw = msg.content;
-                const m = raw.match(/```json\s*([\s\S]*?)```/);
-                if (m) raw = m[1];
-                return JSON.parse(raw.trim());
+                const fragments = await Promise.all(
+                    towerMemoryMessageIds.map(id => channel.messages.fetch(id))
+                );
+                const joined = fragments.map(m => unwrapChunk(m.content)).join('');
+                return JSON.parse(joined);
             } catch {
-                towerMemoryMessageId = null;
+                towerMemoryMessageIds = [];
             }
         }
 
-        // Scan for oldest bot message
-        const messages = await channel.messages.fetch({ limit: 50 });
-        const botMessages = messages
+        // Slow path: scan channel for bot messages, sort oldest-first
+        const fetched = await channel.messages.fetch({ limit: 100 });
+        const botMsgs = [...fetched.values()]
             .filter(m => m.author.id === client.user.id)
             .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
 
-        if (botMessages.size === 0) return { scores: {}, cooldowns: {} };
+        if (botMsgs.length === 0) return { scores: {}, cooldowns: {} };
 
-        const msg = botMessages.first();
-        towerMemoryMessageId = msg.id;
-
-        let raw = msg.content;
-        const m = raw.match(/```json\s*([\s\S]*?)```/);
-        if (m) raw = m[1];
-        return JSON.parse(raw.trim());
+        towerMemoryMessageIds = botMsgs.map(m => m.id);
+        const joined = botMsgs.map(m => unwrapChunk(m.content)).join('');
+        return JSON.parse(joined);
     } catch (err) {
         console.error('Failed to load tower memory:', err);
         return { scores: {}, cooldowns: {} };
     }
 }
 
+/**
+ * Save the main tower memory. Splits JSON into ≤1990-char chunks, edits
+ * existing messages in place, sends new ones if needed, and deletes any
+ * now-surplus messages so the channel stays tidy.
+ */
 async function saveTowerMemory(data) {
     try {
         const channel = await fetchTowerMemoryChannel();
-        const content = '```json\n' + JSON.stringify(data, null, 2) + '\n```';
+        const jsonStr = JSON.stringify(data, null, 2);
+        const chunks = splitJsonIntoChunks(jsonStr);
+        const total = chunks.length;
+        const newIds = [];
 
-        if (towerMemoryMessageId) {
-            try {
-                const msg = await channel.messages.fetch(towerMemoryMessageId);
-                await msg.edit(content);
-                return;
-            } catch {
-                towerMemoryMessageId = null;
+        for (let i = 0; i < chunks.length; i++) {
+            const content = wrapChunk(chunks[i], i + 1, total);
+            if (i < towerMemoryMessageIds.length) {
+                // Edit existing message
+                try {
+                    const msg = await channel.messages.fetch(towerMemoryMessageIds[i]);
+                    await msg.edit(content);
+                    newIds.push(msg.id);
+                } catch {
+                    // Message gone — send a new one
+                    const sent = await channel.send(content);
+                    newIds.push(sent.id);
+                }
+            } else {
+                // Need a new message
+                const sent = await channel.send(content);
+                newIds.push(sent.id);
             }
         }
 
-        const newMsg = await channel.send(content);
-        towerMemoryMessageId = newMsg.id;
+        // Delete any surplus messages from a previous (larger) save
+        for (let i = chunks.length; i < towerMemoryMessageIds.length; i++) {
+            try {
+                const msg = await channel.messages.fetch(towerMemoryMessageIds[i]);
+                await msg.delete();
+            } catch { /* already gone */ }
+        }
+
+        towerMemoryMessageIds = newIds;
     } catch (err) {
         console.error('Failed to save tower memory:', err);
     }
 }
 
-// ─── Tower rolls memory (separate channel) ────────────────────────────────────
-let towerRollsMessageId = null;
+// ─── Tower rolls memory (separate channel, same chunked approach) ─────────────
+let towerRollsMessageIds = [];
 
 async function fetchTowerRollsChannel() {
     return await client.channels.fetch(TOWER_ROLLS_CHANNEL_ID);
@@ -2692,32 +2753,28 @@ async function loadTowerRolls() {
     try {
         const channel = await fetchTowerRollsChannel();
 
-        if (towerRollsMessageId) {
+        if (towerRollsMessageIds.length > 0) {
             try {
-                const msg = await channel.messages.fetch(towerRollsMessageId);
-                let raw = msg.content;
-                const m = raw.match(/```json\s*([\s\S]*?)```/);
-                if (m) raw = m[1];
-                return JSON.parse(raw.trim());
+                const fragments = await Promise.all(
+                    towerRollsMessageIds.map(id => channel.messages.fetch(id))
+                );
+                const joined = fragments.map(m => unwrapChunk(m.content)).join('');
+                return JSON.parse(joined);
             } catch {
-                towerRollsMessageId = null;
+                towerRollsMessageIds = [];
             }
         }
 
-        const messages = await channel.messages.fetch({ limit: 50 });
-        const botMessages = messages
+        const fetched = await channel.messages.fetch({ limit: 100 });
+        const botMsgs = [...fetched.values()]
             .filter(m => m.author.id === client.user.id)
             .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
 
-        if (botMessages.size === 0) return {};
+        if (botMsgs.length === 0) return {};
 
-        const msg = botMessages.first();
-        towerRollsMessageId = msg.id;
-
-        let raw = msg.content;
-        const m = raw.match(/```json\s*([\s\S]*?)```/);
-        if (m) raw = m[1];
-        return JSON.parse(raw.trim());
+        towerRollsMessageIds = botMsgs.map(m => m.id);
+        const joined = botMsgs.map(m => unwrapChunk(m.content)).join('');
+        return JSON.parse(joined);
     } catch (err) {
         console.error('Failed to load tower rolls memory:', err);
         return {};
@@ -2727,20 +2784,36 @@ async function loadTowerRolls() {
 async function saveTowerRolls(rolls) {
     try {
         const channel = await fetchTowerRollsChannel();
-        const content = '```json\n' + JSON.stringify(rolls, null, 2) + '\n```';
+        const jsonStr = JSON.stringify(rolls, null, 2);
+        const chunks = splitJsonIntoChunks(jsonStr);
+        const total = chunks.length;
+        const newIds = [];
 
-        if (towerRollsMessageId) {
-            try {
-                const msg = await channel.messages.fetch(towerRollsMessageId);
-                await msg.edit(content);
-                return;
-            } catch {
-                towerRollsMessageId = null;
+        for (let i = 0; i < chunks.length; i++) {
+            const content = wrapChunk(chunks[i], i + 1, total);
+            if (i < towerRollsMessageIds.length) {
+                try {
+                    const msg = await channel.messages.fetch(towerRollsMessageIds[i]);
+                    await msg.edit(content);
+                    newIds.push(msg.id);
+                } catch {
+                    const sent = await channel.send(content);
+                    newIds.push(sent.id);
+                }
+            } else {
+                const sent = await channel.send(content);
+                newIds.push(sent.id);
             }
         }
 
-        const newMsg = await channel.send(content);
-        towerRollsMessageId = newMsg.id;
+        for (let i = chunks.length; i < towerRollsMessageIds.length; i++) {
+            try {
+                const msg = await channel.messages.fetch(towerRollsMessageIds[i]);
+                await msg.delete();
+            } catch { /* already gone */ }
+        }
+
+        towerRollsMessageIds = newIds;
     } catch (err) {
         console.error('Failed to save tower rolls memory:', err);
     }
@@ -2869,11 +2942,13 @@ async function handleStats(message) {
             return;
         }
 
-        // Sort towers by roll count descending
-        const sorted = Object.entries(userRolls).sort(([, a], [, b]) => b - a);
+        // Build a rank lookup from the TOWERS array
+        const rankOf = Object.fromEntries(TOWERS.map(t => [t.name, t.rank]));
 
-        // Split into pages of 20 towers if there are many
-        const PAGE_SIZE = 20;
+        // Sort by rank ascending (rank 1 = hardest)
+        const sorted = Object.entries(userRolls)
+            .sort(([nameA], [nameB]) => (rankOf[nameA] ?? 9999) - (rankOf[nameB] ?? 9999));
+
         const lines = sorted.map(([name, count]) => `**${name}** — rolled **${count}**x`);
 
         // Build description in chunks to respect Discord's 4096 char embed limit
