@@ -680,6 +680,11 @@ async function handleTempRaidban(ctx, { targetId, durationStr, reason }) {
 // ─── Message handler ──────────────────────────────────────────────────────────
 client.on(Events.MessageCreate, async message => {
     if (message.author.bot) return;
+    if (message.content.trim().toLowerCase() === 'hi' && Math.random() < 0.25) {
+        await message.channel.send('hi');
+        return;
+    }
+
     if (!message.content.startsWith(PREFIX)) return;
 
     const fullContent = message.content.slice(PREFIX.length).trim();
