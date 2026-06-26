@@ -2631,10 +2631,20 @@ function toMessage(obj) {
     return '```json\n' + JSON.stringify(obj, null, 2) + '\n```';
 }
 
-/** Parse a single Discord message back to an object. */
+/**
+ * Parse a single Discord message back to an object.
+ * Returns null instead of throwing so one bad message never breaks a full load.
+ */
 function fromMessage(content) {
-    const m = content.match(/```json\s*([\s\S]*?)```/);
-    return JSON.parse(m ? m[1].trim() : content.trim());
+    try {
+        const m = content.match(/```json\s*([\s\S]*?)```/);
+        const raw = m ? m[1].trim() : content.trim();
+        // Strip old chunk-comment lines left over from the previous storage format
+        const stripped = raw.replace(/^\/\/ chunk:\d+\/\d+\s*/m, '');
+        return JSON.parse(stripped);
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -2705,30 +2715,60 @@ async function saveBins(channel, bins, existingIds) {
 }
 
 /**
- * Generic load: fetches all bot messages in a channel (oldest first),
- * parses each independently, and returns { objects, ids }.
+ * Generic load: fetches ALL bot messages in a channel (oldest first),
+ * parses each independently, skips any that fail to parse, and returns { objects, ids }.
+ *
+ * Fast path: if we have cached IDs, fetch each individually and parse.
+ *   Bad messages are skipped (null) rather than failing the whole load.
+ * Slow path: paginate through the entire channel history in batches of 100
+ *   (Discord's max per request) so no messages are ever missed.
  */
 async function loadAllBins(channel, cachedIds) {
-    // Fast path — we already know the IDs
+    // Fast path — fetch each known message individually, tolerating failures
     if (cachedIds.length > 0) {
-        try {
-            const msgs = await Promise.all(cachedIds.map(id => channel.messages.fetch(id)));
-            return { objects: msgs.map(m => fromMessage(m.content)), ids: cachedIds };
-        } catch {
-            // Fall through to slow path
+        const results = await Promise.allSettled(
+            cachedIds.map(id => channel.messages.fetch(id))
+        );
+        const goodMsgs = results
+            .filter(r => r.status === 'fulfilled')
+            .map(r => r.value);
+
+        // Only use the fast path if we got back the same number of messages we expected
+        if (goodMsgs.length === cachedIds.length) {
+            const objects = goodMsgs.map(m => fromMessage(m.content)).filter(Boolean);
+            return { objects, ids: cachedIds };
         }
+        // Some messages were missing — fall through to full rescan
     }
 
-    // Slow path — scan the channel
-    const fetched = await channel.messages.fetch({ limit: 100 });
-    const botMsgs = [...fetched.values()]
-        .filter(m => m.author.id === client.user.id)
-        .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    // Slow path — paginate through ALL messages in the channel oldest-first.
+    // Discord returns messages newest-first, so we collect pages then reverse.
+    const allBotMsgs = [];
+    let before = undefined;
 
-    return {
-        objects: botMsgs.map(m => fromMessage(m.content)),
-        ids: botMsgs.map(m => m.id),
-    };
+    while (true) {
+        const options = { limit: 100 };
+        if (before) options.before = before;
+
+        const page = await channel.messages.fetch(options);
+        if (page.size === 0) break;
+
+        const botMsgs = [...page.values()].filter(m => m.author.id === client.user.id);
+        allBotMsgs.push(...botMsgs);
+
+        if (page.size < 100) break; // last page
+        // Move cursor to before the oldest message in this page
+        before = [...page.values()].reduce(
+            (oldest, m) => m.createdTimestamp < oldest.createdTimestamp ? m : oldest
+        ).id;
+    }
+
+    // Sort oldest-first so bins are merged in the correct order
+    allBotMsgs.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+    const ids = allBotMsgs.map(m => m.id);
+    const objects = allBotMsgs.map(m => fromMessage(m.content)).filter(Boolean);
+    return { objects, ids };
 }
 
 // ─── Main tower memory (scores + cooldowns) ───────────────────────────────────
