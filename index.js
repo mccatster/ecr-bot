@@ -3140,27 +3140,41 @@ async function handleStats(message) {
     });
 }
 
-async function handleRemoveUser(message, targetId) {
+async function handleRemoveRoll(message, targetUser, towerQuery) {
     await enqueueTowerTask(async () => {
-        const data = await loadTowerMemory();
-        const rolls = await loadTowerRolls();
+        const query = towerQuery.toLowerCase();
+        const tower = TOWERS.find(t => t.name.toLowerCase() === query)
+            ?? TOWERS.find(t => t.name.toLowerCase().includes(query));
 
-        const hadScore = !!data.scores?.[targetId];
-        const hadRolls = !!rolls[targetId];
-
-        if (!hadScore && !hadRolls) {
-            await message.channel.send(`❌ No data found for <@${targetId}>.`);
+        if (!tower) {
+            await message.channel.send(`❌ No tower found matching \`${towerQuery}\`.`);
             return;
         }
 
-        delete data.scores[targetId];
-        delete data.cooldowns[targetId];
-        delete rolls[targetId];
+        const userId = targetUser.id;
 
-        await saveTowerMemory(data);
+        const rolls = await loadTowerRolls();
+        const userRolls = rolls[userId];
+        if (!userRolls || !userRolls[tower.name]) {
+            await message.channel.send(`❌ **${targetUser.username}** has no rolls of **${tower.name}**.`);
+            return;
+        }
+
+        // Decrement roll count, remove entry if it hits 0
+        userRolls[tower.name]--;
+        if (userRolls[tower.name] <= 0) delete userRolls[tower.name];
         await saveTowerRolls(rolls);
 
-        await message.channel.send(`✅ Removed all tower data for <@${targetId}>.`);
+        // Subtract points
+        const data = await loadTowerMemory();
+        if (data.scores?.[userId]) {
+            data.scores[userId].pts = Math.round((data.scores[userId].pts - tower.pts) * 100) / 100;
+        }
+        await saveTowerMemory(data);
+
+        await message.channel.send(
+            `✅ Removed one roll of **${tower.name}** from **${targetUser.username}**. *(-${tower.pts} pts)*`
+        );
     });
 }
 
@@ -4041,11 +4055,21 @@ client.on(Events.MessageCreate, async message => {
         const idMatch = args.match(/^(\d+)/);
 
         if (command === 'remove') {
-            let targetId;
-            if (mentionMatch) targetId = mentionMatch[1];
-            else if (idMatch) targetId = idMatch[1];
-            else return message.reply('Usage: `;remove <@user or user ID>`');
-            await handleRemoveUser(message, targetId);
+            let targetId, towerQuery;
+            if (mentionMatch) {
+                targetId = mentionMatch[1];
+                towerQuery = args.slice(mentionMatch[0].length).trim();
+            } else if (idMatch) {
+                targetId = idMatch[1];
+                towerQuery = args.slice(idMatch[0].length).trim();
+            } else {
+                return message.reply('Usage: `;remove <@user or user ID> <tower name>`');
+            }
+            if (!towerQuery) return message.reply('Usage: `;remove <@user or user ID> <tower name>`');
+            let targetUser;
+            try { targetUser = await client.users.fetch(targetId); }
+            catch { return message.reply('❌ Could not find that user.'); }
+            await handleRemoveRoll(message, targetUser, towerQuery);
             return;
         }
 
