@@ -2734,7 +2734,12 @@ async function saveBins(channel, bins, existingIds) {
                 await msg.edit(content);
                 newIds.push(msg.id);
             } catch {
-                // Message gone — send a fresh one
+                // Message gone or edit failed (e.g. content too large) —
+                // delete the old message if it still exists, then send fresh.
+                try {
+                    const old = await channel.messages.fetch(existingIds[i]);
+                    await old.delete();
+                } catch { /* already gone */ }
                 const sent = await channel.send(content);
                 newIds.push(sent.id);
             }
@@ -2894,12 +2899,55 @@ async function saveTowerRolls(rolls) {
     try {
         const channel = await fetchTowerRollsChannel();
 
-        const bins = packIntoBins(
-            Object.keys(rolls),
-            uid => rolls[uid] && Object.keys(rolls[uid]).length > 0 ? rolls[uid] : null,
-            entries => ({ ...entries })
-        );
+        // Build bins, allowing a single user's tower map to be split across
+        // multiple messages when it's too large to fit in one.
+        const bins = [];
+        let currentBin = {};
 
+        function flushBin() {
+            if (Object.keys(currentBin).length > 0) {
+                bins.push({ ...currentBin });
+                currentBin = {};
+            }
+        }
+
+        for (const uid of Object.keys(rolls)) {
+            const userTowers = rolls[uid];
+            if (!userTowers || Object.keys(userTowers).length === 0) continue;
+
+            // Try adding the full user entry to the current bin
+            const testBin = { ...currentBin, [uid]: userTowers };
+            if (toMessage(testBin).length <= MSG_CHAR_LIMIT) {
+                currentBin = testBin;
+                continue;
+            }
+
+            // Doesn't fit whole — flush current bin first
+            flushBin();
+
+            // Now try to fit this user's towers, splitting by individual tower
+            // entries if needed so no single message ever exceeds the limit.
+            let userChunk = {};
+            for (const [towerName, count] of Object.entries(userTowers)) {
+                const testChunk = { ...userChunk, [towerName]: count };
+                const testBinSolo = { [uid]: testChunk };
+                if (toMessage(testBinSolo).length > MSG_CHAR_LIMIT) {
+                    // Flush what we have for this user so far into its own bin
+                    if (Object.keys(userChunk).length > 0) {
+                        bins.push({ [uid]: { ...userChunk } });
+                    }
+                    userChunk = { [towerName]: count };
+                } else {
+                    userChunk = testChunk;
+                }
+            }
+            // Remaining towers for this user become the start of the next bin
+            if (Object.keys(userChunk).length > 0) {
+                currentBin = { [uid]: userChunk };
+            }
+        }
+
+        flushBin();
         if (bins.length === 0) bins.push({});
 
         towerRollsIds = await saveBins(channel, bins, towerRollsIds);
