@@ -2606,17 +2606,21 @@ const TOWERS = [
 ];
 
 // ─── Tower roll system ────────────────────────────────────────────────────────
-// Memory is stored across one or more Discord messages, each containing a
-// complete, independently-parseable JSON object.  On save the full dataset is
-// re-binned into per-message slices; on load all messages are parsed and merged.
+// Each memory channel holds one or more bot messages.  Every message contains
+// a complete, valid JSON object — never a fragment.  On load, ALL messages in
+// the channel are read, parsed independently, and merged.  On save, the full
+// dataset is repacked into as many messages as needed, old messages are edited
+// in-place, surplus ones are deleted, and new ones are sent if the data grew.
 //
-// Main channel schema (per message): { scores?: {...}, cooldowns?: {...} }
-// Rolls channel schema (per message): { [userId]: { [towerName]: count } }
+// IMPORTANT: `ids` and `objects` are always kept in sync — only messages that
+// parse successfully are included in either list.  Unparseable messages (e.g.
+// leftovers from old storage formats) are deleted from the channel on first
+// encounter so they never corrupt the index again.
 //
-// This means every message is always valid JSON on its own, so a bot restart
-// never causes a partial-parse failure regardless of how many messages exist.
+// Main channel  — per message: { scores?: { uid: {username,pts} }, cooldowns?: { uid: ms } }
+// Rolls channel — per message: { uid: { towerName: count }, … }
 
-const MSG_CHAR_LIMIT = 1990; // safe ceiling below Discord's hard 2000-char limit
+const MSG_CHAR_LIMIT = 1900; // conservative ceiling well below Discord's 2000-char hard limit
 
 let towerMemoryWriteLock = Promise.resolve();
 
@@ -2626,62 +2630,98 @@ function enqueueTowerTask(fn) {
     return next;
 }
 
-/** Wrap an object as a JSON code-fence message. */
+/** Serialise a plain object into a Discord message string. */
 function toMessage(obj) {
     return '```json\n' + JSON.stringify(obj, null, 2) + '\n```';
 }
 
 /**
- * Parse a single Discord message back to an object.
- * Returns null instead of throwing so one bad message never breaks a full load.
+ * Parse one Discord message content back to a plain object.
+ * Returns null for anything that isn't valid JSON (old chunk fragments,
+ * stray messages, etc.) so callers can skip/delete them gracefully.
  */
 function fromMessage(content) {
     try {
         const m = content.match(/```json\s*([\s\S]*?)```/);
-        const raw = m ? m[1].trim() : content.trim();
-        // Strip old chunk-comment lines left over from the previous storage format
-        const stripped = raw.replace(/^\/\/ chunk:\d+\/\d+\s*/m, '');
-        return JSON.parse(stripped);
+        if (!m) return null;
+        return JSON.parse(m[1].trim());
     } catch {
         return null;
     }
 }
 
 /**
- * Bin a flat record of { key -> value } into an ordered array of plain objects,
- * each of which serialises to ≤ MSG_CHAR_LIMIT characters when fence-wrapped.
- * Every bin is a complete { key: value, … } object — always valid JSON on its own.
+ * Fetch and parse ALL bot messages in a channel.
  *
- * topLevelKeys lets callers control which top-level keys sit in the same bin
- * (used for scores + cooldowns which must travel together in the main channel).
+ * - Paginates in batches of 100 (Discord's per-request max) so nothing is missed.
+ * - Parses each message independently; unparseable ones are deleted from the
+ *   channel and excluded from the result so they never pollute future loads.
+ * - Returns { objects, ids } where objects[i] corresponds to ids[i] (always in sync).
+ * - Results are sorted oldest-first so merge order is deterministic.
+ *
+ * `cachedIds` — if provided and every ID is still fetchable, skips the full scan.
  */
-function binEntries(entries) {
-    // entries: array of [key, value] pairs
-    const bins = [];
-    let current = {};
-    let currentLen = toMessage(current).length;
-
-    for (const [k, v] of entries) {
-        const addition = toMessage({ [k]: v });
-        // Estimate extra chars this entry adds when merged into current
-        const merged = { ...current, [k]: v };
-        const mergedLen = toMessage(merged).length;
-
-        if (mergedLen > MSG_CHAR_LIMIT && Object.keys(current).length > 0) {
-            bins.push(current);
-            current = { [k]: v };
-        } else {
-            current = merged;
+async function loadAllBins(channel, cachedIds) {
+    // Fast path: we know exactly which messages to read
+    if (cachedIds.length > 0) {
+        const results = await Promise.allSettled(
+            cachedIds.map(id => channel.messages.fetch(id))
+        );
+        // If every cached message is still there, use them directly
+        if (results.every(r => r.status === 'fulfilled')) {
+            const msgs = results.map(r => r.value);
+            const objects = msgs.map(m => fromMessage(m.content));
+            // If any cached message no longer parses, fall through to full rescan
+            if (objects.every(o => o !== null)) {
+                return { objects, ids: cachedIds };
+            }
         }
+        // Something is wrong with the cache — do a full rescan
     }
-    if (Object.keys(current).length > 0) bins.push(current);
-    return bins;
+
+    // Slow path: paginate through the entire channel history
+    const allMsgs = [];
+    let before = undefined;
+
+    while (true) {
+        const opts = { limit: 100 };
+        if (before) opts.before = before;
+        const page = await channel.messages.fetch(opts);
+        if (page.size === 0) break;
+
+        allMsgs.push(...page.values());
+
+        if (page.size < 100) break;
+        before = [...page.values()]
+            .reduce((oldest, m) => m.createdTimestamp < oldest.createdTimestamp ? m : oldest)
+            .id;
+    }
+
+    // Sort oldest-first
+    allMsgs.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+    // Parse each message; delete and skip anything unparseable
+    const ids = [];
+    const objects = [];
+    for (const msg of allMsgs) {
+        if (msg.author.id !== client.user.id) continue;
+        const obj = fromMessage(msg.content);
+        if (obj === null) {
+            // Old format or garbage — delete so it never interferes again
+            try { await msg.delete(); } catch { /* already gone */ }
+            continue;
+        }
+        ids.push(msg.id);
+        objects.push(obj);
+    }
+
+    return { ids, objects };
 }
 
 /**
- * Generic save: takes an array of plain objects (bins) and the channel.
- * Edits existing bot messages in order, sends new ones, deletes surplus.
- * Returns the updated list of message IDs.
+ * Write `bins` (array of plain objects) to `channel`, reusing existing messages
+ * where possible, sending new ones when needed, and deleting any surplus.
+ * Returns the updated ordered list of message IDs.
  */
 async function saveBins(channel, bins, existingIds) {
     const newIds = [];
@@ -2694,6 +2734,7 @@ async function saveBins(channel, bins, existingIds) {
                 await msg.edit(content);
                 newIds.push(msg.id);
             } catch {
+                // Message gone — send a fresh one
                 const sent = await channel.send(content);
                 newIds.push(sent.id);
             }
@@ -2703,7 +2744,7 @@ async function saveBins(channel, bins, existingIds) {
         }
     }
 
-    // Delete surplus messages from a previously larger save
+    // Delete messages that are no longer needed
     for (let i = bins.length; i < existingIds.length; i++) {
         try {
             const msg = await channel.messages.fetch(existingIds[i]);
@@ -2715,60 +2756,34 @@ async function saveBins(channel, bins, existingIds) {
 }
 
 /**
- * Generic load: fetches ALL bot messages in a channel (oldest first),
- * parses each independently, skips any that fail to parse, and returns { objects, ids }.
- *
- * Fast path: if we have cached IDs, fetch each individually and parse.
- *   Bad messages are skipped (null) rather than failing the whole load.
- * Slow path: paginate through the entire channel history in batches of 100
- *   (Discord's max per request) so no messages are ever missed.
+ * Pack a user-keyed dataset into bins that each fit within MSG_CHAR_LIMIT.
+ * `makeEntry(uid)` returns the value to store for that user.
+ * `makeBin(entries)` wraps a { uid -> value } map into the final bin object.
  */
-async function loadAllBins(channel, cachedIds) {
-    // Fast path — fetch each known message individually, tolerating failures
-    if (cachedIds.length > 0) {
-        const results = await Promise.allSettled(
-            cachedIds.map(id => channel.messages.fetch(id))
-        );
-        const goodMsgs = results
-            .filter(r => r.status === 'fulfilled')
-            .map(r => r.value);
+function packIntoBins(userIds, makeEntry, makeBin) {
+    const bins = [];
+    let currentEntries = {};
 
-        // Only use the fast path if we got back the same number of messages we expected
-        if (goodMsgs.length === cachedIds.length) {
-            const objects = goodMsgs.map(m => fromMessage(m.content)).filter(Boolean);
-            return { objects, ids: cachedIds };
+    for (const uid of userIds) {
+        const entry = makeEntry(uid);
+        if (entry === null) continue; // skip users with nothing to store
+
+        const test = { ...currentEntries, [uid]: entry };
+        const testBin = makeBin(test);
+
+        if (toMessage(testBin).length > MSG_CHAR_LIMIT && Object.keys(currentEntries).length > 0) {
+            bins.push(makeBin(currentEntries));
+            currentEntries = { [uid]: entry };
+        } else {
+            currentEntries = test;
         }
-        // Some messages were missing — fall through to full rescan
     }
 
-    // Slow path — paginate through ALL messages in the channel oldest-first.
-    // Discord returns messages newest-first, so we collect pages then reverse.
-    const allBotMsgs = [];
-    let before = undefined;
-
-    while (true) {
-        const options = { limit: 100 };
-        if (before) options.before = before;
-
-        const page = await channel.messages.fetch(options);
-        if (page.size === 0) break;
-
-        const botMsgs = [...page.values()].filter(m => m.author.id === client.user.id);
-        allBotMsgs.push(...botMsgs);
-
-        if (page.size < 100) break; // last page
-        // Move cursor to before the oldest message in this page
-        before = [...page.values()].reduce(
-            (oldest, m) => m.createdTimestamp < oldest.createdTimestamp ? m : oldest
-        ).id;
+    if (Object.keys(currentEntries).length > 0) {
+        bins.push(makeBin(currentEntries));
     }
 
-    // Sort oldest-first so bins are merged in the correct order
-    allBotMsgs.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
-    const ids = allBotMsgs.map(m => m.id);
-    const objects = allBotMsgs.map(m => fromMessage(m.content)).filter(Boolean);
-    return { objects, ids };
+    return bins;
 }
 
 // ─── Main tower memory (scores + cooldowns) ───────────────────────────────────
@@ -2784,7 +2799,6 @@ async function loadTowerMemory() {
         const { objects, ids } = await loadAllBins(channel, towerMemoryIds);
         towerMemoryIds = ids;
 
-        // Merge all bin objects into one combined data object
         const data = { scores: {}, cooldowns: {} };
         for (const obj of objects) {
             if (obj.scores)    Object.assign(data.scores,    obj.scores);
@@ -2801,52 +2815,31 @@ async function saveTowerMemory(data) {
     try {
         const channel = await fetchTowerMemoryChannel();
 
-        // Build a flat entry list: each userId gets one entry that contains
-        // both their score and their cooldown (if any), so related data travels together.
-        const allUserIds = new Set([
-            ...Object.keys(data.scores || {}),
+        const allUids = [...new Set([
+            ...Object.keys(data.scores    || {}),
             ...Object.keys(data.cooldowns || {}),
-        ]);
+        ])];
 
-        const entries = [...allUserIds].map(uid => [uid, {
-            ...(data.scores[uid]    ? { score:    data.scores[uid]    } : {}),
-            ...(data.cooldowns[uid] ? { cooldown: data.cooldowns[uid] } : {}),
-        }]);
-
-        // We need scores/cooldowns split by top-level key for loading compatibility,
-        // so store each bin as { scores: {...}, cooldowns: {...} } slices instead.
-        // Re-bin by user, keeping both top-level keys intact per bin.
-        const bins = [];
-        let currentScores = {};
-        let currentCooldowns = {};
-
-        for (const uid of allUserIds) {
-            const testScores    = { ...currentScores,    ...(data.scores[uid]    ? { [uid]: data.scores[uid]    } : {}) };
-            const testCooldowns = { ...currentCooldowns, ...(data.cooldowns[uid] ? { [uid]: data.cooldowns[uid] } : {}) };
-            const testBin = {};
-            if (Object.keys(testScores).length)    testBin.scores    = testScores;
-            if (Object.keys(testCooldowns).length) testBin.cooldowns = testCooldowns;
-
-            if (toMessage(testBin).length > MSG_CHAR_LIMIT && Object.keys(currentScores).length > 0) {
-                // Flush current bin and start a new one with just this user
-                const flush = {};
-                if (Object.keys(currentScores).length)    flush.scores    = currentScores;
-                if (Object.keys(currentCooldowns).length) flush.cooldowns = currentCooldowns;
-                bins.push(flush);
-                currentScores    = data.scores[uid]    ? { [uid]: data.scores[uid]    } : {};
-                currentCooldowns = data.cooldowns[uid] ? { [uid]: data.cooldowns[uid] } : {};
-            } else {
-                currentScores    = testScores;
-                currentCooldowns = testCooldowns;
+        const bins = packIntoBins(
+            allUids,
+            uid => {
+                const score    = data.scores?.[uid]    ?? null;
+                const cooldown = data.cooldowns?.[uid] ?? null;
+                return (score || cooldown) ? { score, cooldown } : null;
+            },
+            entries => {
+                const scores    = {};
+                const cooldowns = {};
+                for (const [uid, { score, cooldown }] of Object.entries(entries)) {
+                    if (score)    scores[uid]    = score;
+                    if (cooldown) cooldowns[uid] = cooldown;
+                }
+                const bin = {};
+                if (Object.keys(scores).length)    bin.scores    = scores;
+                if (Object.keys(cooldowns).length) bin.cooldowns = cooldowns;
+                return bin;
             }
-        }
-        // Flush remaining
-        if (Object.keys(currentScores).length || Object.keys(currentCooldowns).length) {
-            const flush = {};
-            if (Object.keys(currentScores).length)    flush.scores    = currentScores;
-            if (Object.keys(currentCooldowns).length) flush.cooldowns = currentCooldowns;
-            bins.push(flush);
-        }
+        );
 
         if (bins.length === 0) bins.push({ scores: {}, cooldowns: {} });
 
@@ -2856,8 +2849,8 @@ async function saveTowerMemory(data) {
     }
 }
 
-// ─── Tower rolls memory (separate channel, same approach) ─────────────────────
-// Each message: { [userId]: { [towerName]: count, ... }, ... }
+// ─── Tower rolls memory (separate channel) ────────────────────────────────────
+// Each message: { [userId]: { [towerName]: count, … }, … }
 let towerRollsIds = [];
 
 async function fetchTowerRollsChannel() {
@@ -2870,12 +2863,11 @@ async function loadTowerRolls() {
         const { objects, ids } = await loadAllBins(channel, towerRollsIds);
         towerRollsIds = ids;
 
-        // Merge all bin objects — each is { userId: { towerName: count } }
         const rolls = {};
         for (const obj of objects) {
-            for (const [uid, towerCounts] of Object.entries(obj)) {
+            for (const [uid, counts] of Object.entries(obj)) {
                 if (!rolls[uid]) rolls[uid] = {};
-                Object.assign(rolls[uid], towerCounts);
+                Object.assign(rolls[uid], counts);
             }
         }
         return rolls;
@@ -2889,20 +2881,12 @@ async function saveTowerRolls(rolls) {
     try {
         const channel = await fetchTowerRollsChannel();
 
-        // Bin users: each bin is { userId: { towerName: count } }
-        const bins = [];
-        let current = {};
+        const bins = packIntoBins(
+            Object.keys(rolls),
+            uid => rolls[uid] && Object.keys(rolls[uid]).length > 0 ? rolls[uid] : null,
+            entries => ({ ...entries })
+        );
 
-        for (const [uid, towerCounts] of Object.entries(rolls)) {
-            const test = { ...current, [uid]: towerCounts };
-            if (toMessage(test).length > MSG_CHAR_LIMIT && Object.keys(current).length > 0) {
-                bins.push(current);
-                current = { [uid]: towerCounts };
-            } else {
-                current = test;
-            }
-        }
-        if (Object.keys(current).length > 0) bins.push(current);
         if (bins.length === 0) bins.push({});
 
         towerRollsIds = await saveBins(channel, bins, towerRollsIds);
