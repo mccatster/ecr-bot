@@ -25,7 +25,7 @@ const RAIDBAN_ROLE_ID = '1482487254814294170';
 const TEMPRAIDBAN_MEMORY_CHANNEL_ID = '1519798660001435679';
 const TOWER_MEMORY_CHANNEL_ID = '1519811705977442345';
 const TOWER_ROLLS_CHANNEL_ID = '1519823488066650273';
-const TOWER_COOLDOWN_MS = 1 * 60 * 60 * 1000; // 1 hour
+const TOWER_COOLDOWN_MS = 45 * 60 * 1000; // 45 minutes
 const TOWER_COOLDOWN_BYPASS = ['1154253852476973086'];
 const PREFIX = ';';
 
@@ -2771,9 +2771,22 @@ function packIntoBins(userIds, makeEntry, makeBin) {
         const test = { ...currentEntries, [uid]: entry };
         const testBin = makeBin(test);
 
-        if (toMessage(testBin).length > MSG_CHAR_LIMIT && Object.keys(currentEntries).length > 0) {
-            bins.push(makeBin(currentEntries));
-            currentEntries = { [uid]: entry };
+        if (toMessage(testBin).length > MSG_CHAR_LIMIT) {
+            // Flush whatever we have accumulated so far.
+            if (Object.keys(currentEntries).length > 0) {
+                bins.push(makeBin(currentEntries));
+                currentEntries = {};
+            }
+            // Check if this single user's entry alone fits.
+            const soloTest = { [uid]: entry };
+            if (toMessage(makeBin(soloTest)).length > MSG_CHAR_LIMIT) {
+                // Entry is too large even on its own — flush it alone so it
+                // never blocks subsequent users from being stored correctly.
+                bins.push(makeBin(soloTest));
+                // currentEntries stays empty for the next iteration.
+            } else {
+                currentEntries = soloTest;
+            }
         } else {
             currentEntries = test;
         }
@@ -3122,15 +3135,28 @@ async function loadTempRaidbanMemory() {
             }
         }
 
-        // Scan for oldest bot message (the canonical memory message)
-        const messages = await channel.messages.fetch({ limit: 50 });
-        const botMessages = messages
+        // Paginate through the entire channel history to find the oldest bot message
+        const allMsgs = [];
+        let before = undefined;
+        while (true) {
+            const opts = { limit: 100 };
+            if (before) opts.before = before;
+            const page = await channel.messages.fetch(opts);
+            if (page.size === 0) break;
+            allMsgs.push(...page.values());
+            if (page.size < 100) break;
+            before = [...page.values()]
+                .reduce((oldest, m) => m.createdTimestamp < oldest.createdTimestamp ? m : oldest)
+                .id;
+        }
+
+        const botMessages = allMsgs
             .filter(m => m.author.id === client.user.id)
             .sort((a, b) => a.createdTimestamp - b.createdTimestamp); // oldest first
 
-        if (botMessages.size === 0) return [];
+        if (botMessages.length === 0) return [];
 
-        const msg = botMessages.first();
+        const msg = botMessages[0];
         tempRaidbanMemoryMessageId = msg.id;
 
         let raw = msg.content;
