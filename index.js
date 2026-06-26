@@ -2664,8 +2664,9 @@ function fromMessage(content) {
 async function loadAllBins(channel, cachedIds) {
     // Fast path: we know exactly which messages to read
     if (cachedIds.length > 0) {
+        console.log(`[loadAllBins] Fast path: fetching ${cachedIds.length} cached IDs in #${channel.name}`);
         const results = await Promise.allSettled(
-            cachedIds.map(id => channel.messages.fetch(id))
+            cachedIds.map(id => channel.messages.fetch(id, { force: true }))
         );
         // If every cached message is still there, use them directly
         if (results.every(r => r.status === 'fulfilled')) {
@@ -2673,8 +2674,12 @@ async function loadAllBins(channel, cachedIds) {
             const objects = msgs.map(m => fromMessage(m.content));
             // If any cached message no longer parses, fall through to full rescan
             if (objects.every(o => o !== null)) {
+                console.log(`[loadAllBins] Fast path success: ${objects.length} bins loaded`);
                 return { objects, ids: cachedIds };
             }
+            console.log(`[loadAllBins] Fast path: some messages failed to parse, falling back to slow path`);
+        } else {
+            console.log(`[loadAllBins] Fast path: some fetches failed, falling back to slow path`);
         }
         // Something is wrong with the cache — do a full rescan
     }
@@ -2708,6 +2713,7 @@ async function loadAllBins(channel, cachedIds) {
         const obj = fromMessage(msg.content);
         if (obj === null) {
             // Old format or garbage — delete so it never interferes again
+            console.log(`[loadAllBins] Deleting unparseable message ${msg.id} (len=${msg.content.length}): ${msg.content.slice(0, 80)}`);
             try { await msg.delete(); } catch { /* already gone */ }
             continue;
         }
@@ -2715,6 +2721,7 @@ async function loadAllBins(channel, cachedIds) {
         objects.push(obj);
     }
 
+    console.log(`[loadAllBins] Slow path done: ${ids.length} valid bins found in #${channel.name}`);
     return { ids, objects };
 }
 
@@ -2725,26 +2732,32 @@ async function loadAllBins(channel, cachedIds) {
  */
 async function saveBins(channel, bins, existingIds) {
     const newIds = [];
+    console.log(`[saveBins] Writing ${bins.length} bins to #${channel.name}, have ${existingIds.length} existing IDs`);
 
     for (let i = 0; i < bins.length; i++) {
         const content = toMessage(bins[i]);
+        console.log(`[saveBins] Bin ${i}: ${content.length} chars`);
         if (i < existingIds.length) {
             try {
-                const msg = await channel.messages.fetch(existingIds[i]);
+                const msg = await channel.messages.fetch(existingIds[i], { force: true });
                 await msg.edit(content);
+                console.log(`[saveBins] Bin ${i}: edited message ${msg.id}`);
                 newIds.push(msg.id);
-            } catch {
+            } catch (err) {
                 // Message gone or edit failed (e.g. content too large) —
                 // delete the old message if it still exists, then send fresh.
+                console.log(`[saveBins] Bin ${i}: edit failed (${err?.message}), deleting old and sending new`);
                 try {
-                    const old = await channel.messages.fetch(existingIds[i]);
+                    const old = await channel.messages.fetch(existingIds[i], { force: true });
                     await old.delete();
                 } catch { /* already gone */ }
                 const sent = await channel.send(content);
+                console.log(`[saveBins] Bin ${i}: sent new message ${sent.id}`);
                 newIds.push(sent.id);
             }
         } else {
             const sent = await channel.send(content);
+            console.log(`[saveBins] Bin ${i}: sent new message ${sent.id}`);
             newIds.push(sent.id);
         }
     }
@@ -2752,11 +2765,13 @@ async function saveBins(channel, bins, existingIds) {
     // Delete messages that are no longer needed
     for (let i = bins.length; i < existingIds.length; i++) {
         try {
-            const msg = await channel.messages.fetch(existingIds[i]);
+            const msg = await channel.messages.fetch(existingIds[i], { force: true });
             await msg.delete();
+            console.log(`[saveBins] Deleted surplus message ${existingIds[i]}`);
         } catch { /* already gone */ }
     }
 
+    console.log(`[saveBins] Done. New IDs: ${newIds.join(', ')}`);
     return newIds;
 }
 
@@ -2888,6 +2903,8 @@ async function loadTowerRolls() {
                 Object.assign(rolls[uid], counts);
             }
         }
+        const userCount = Object.keys(rolls).length;
+        console.log(`[loadTowerRolls] Loaded ${userCount} users across ${objects.length} bins`);
         return rolls;
     } catch (err) {
         console.error('Failed to load tower rolls memory:', err);
@@ -2950,6 +2967,7 @@ async function saveTowerRolls(rolls) {
         flushBin();
         if (bins.length === 0) bins.push({});
 
+        console.log(`[saveTowerRolls] Packed ${Object.keys(rolls).length} users into ${bins.length} bins`);
         towerRollsIds = await saveBins(channel, bins, towerRollsIds);
     } catch (err) {
         console.error('Failed to save tower rolls memory:', err);
