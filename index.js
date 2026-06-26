@@ -66,7 +66,7 @@ const VIEW_ALLOWED_USERS = [
     '477575548944777226'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'remove', 'add', 'give'];
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'remove', 'add', 'give', 'removelb', 'restorelb'];
 const TOWER_ADMIN_USERS = ['477575548944777226'];
 
 const TOWERS = [
@@ -2833,10 +2833,11 @@ async function loadTowerMemory() {
         const { objects, ids } = await loadAllBins(channel, towerMemoryIds);
         towerMemoryIds = ids;
 
-        const data = { scores: {}, cooldowns: {} };
+        const data = { scores: {}, cooldowns: {}, hiddenFromLb: [] };
         for (const obj of objects) {
-            if (obj.scores)    Object.assign(data.scores,    obj.scores);
-            if (obj.cooldowns) Object.assign(data.cooldowns, obj.cooldowns);
+            if (obj.scores)       Object.assign(data.scores,    obj.scores);
+            if (obj.cooldowns)    Object.assign(data.cooldowns, obj.cooldowns);
+            if (obj.hiddenFromLb) data.hiddenFromLb = [...new Set([...data.hiddenFromLb, ...obj.hiddenFromLb])];
         }
         return data;
     } catch (err) {
@@ -2876,6 +2877,8 @@ async function saveTowerMemory(data) {
         );
 
         if (bins.length === 0) bins.push({ scores: {}, cooldowns: {} });
+        // Store hiddenFromLb on the first bin so it's always persisted
+        bins[0].hiddenFromLb = data.hiddenFromLb || [];
 
         towerMemoryIds = await saveBins(channel, bins, towerMemoryIds);
     } catch (err) {
@@ -2883,29 +2886,285 @@ async function saveTowerMemory(data) {
     }
 }
 
-// ─── Tower rolls memory (separate channel) ────────────────────────────────────
-// Each message: { [userId]: { [towerName]: count, … }, … }
-let towerRollsIds = [];
+// ─── Tower rolls memory (separate channel, one message-group per user) ───────
+// Message format: { owner: uid, towers: { [towerName]: count, … } }
+// A single user may span multiple messages if their data exceeds MSG_CHAR_LIMIT.
+// userRollsIndex: Map<uid, string[]>  (uid → ordered list of message IDs)
+let userRollsIndex = null; // null = not yet loaded
 
 async function fetchTowerRollsChannel() {
     return await client.channels.fetch(TOWER_ROLLS_CHANNEL_ID);
 }
 
-async function loadTowerRolls() {
+/** Scan the entire rolls channel and build userRollsIndex from scratch. */
+async function buildRollsIndex(channel) {
+    const index = new Map();
+    let before;
+    const allMsgs = [];
+
+    while (true) {
+        const opts = { limit: 100 };
+        if (before) opts.before = before;
+        const page = await channel.messages.fetch(opts);
+        if (page.size === 0) break;
+        const arr = [...page.values()];
+        allMsgs.push(...arr);
+        if (page.size < 100) break;
+        before = arr.reduce((oldest, m) =>
+            m.createdTimestamp < oldest.createdTimestamp ? m : oldest).id;
+    }
+
+    // Sort oldest-first so message order within a user is preserved
+    allMsgs.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+    for (const msg of allMsgs) {
+        if (msg.author.id !== client.user.id) continue;
+
+        // ── New per-user format ──────────────────────────────────────────────
+        let parsed = null;
+        try {
+            const raw = msg.content.replace(/```json\s*|\s*```/g, '').trim();
+            parsed = JSON.parse(raw);
+        } catch { continue; }
+
+        if (parsed.owner) {
+            // New format
+            const uid = parsed.owner;
+            if (!index.has(uid)) index.set(uid, []);
+            index.get(uid).push(msg.id);
+        } else {
+            // ── Legacy multi-user bin format — migrate in place ───────────────
+            // Rewrite each user's portion into their own new-format message,
+            // then delete the old bin message.
+            const usersInBin = Object.keys(parsed).filter(k => typeof parsed[k] === 'object');
+            for (const uid of usersInBin) {
+                const towers = parsed[uid];
+                if (!towers || Object.keys(towers).length === 0) continue;
+
+                // Merge into any messages we've already written for this user
+                // (handles chunked legacy data across multiple old bins)
+                if (!index.has(uid)) index.set(uid, []);
+                const existingIds = index.get(uid);
+
+                if (existingIds.length > 0) {
+                    // Load last existing message for this user, merge, re-split
+                    // We'll do a full re-save after the scan via migrateLegacyRolls
+                } 
+                // We'll accumulate into a temporary structure and rewrite after
+            }
+            // Mark this message for migration (handled below)
+        }
+    }
+
+    return { index, allMsgs };
+}
+
+/**
+ * One-time migration: reads all messages in the rolls channel, merges all data
+ * into a per-user structure, rewrites as new-format messages, deletes old ones.
+ */
+async function migrateLegacyRolls(channel) {
+    console.log('[migrateLegacyRolls] Scanning channel for legacy bins...');
+    let before;
+    const allMsgs = [];
+
+    while (true) {
+        const opts = { limit: 100 };
+        if (before) opts.before = before;
+        const page = await channel.messages.fetch(opts);
+        if (page.size === 0) break;
+        const arr = [...page.values()];
+        allMsgs.push(...arr);
+        if (page.size < 100) break;
+        before = arr.reduce((oldest, m) =>
+            m.createdTimestamp < oldest.createdTimestamp ? m : oldest).id;
+    }
+
+    allMsgs.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+    const legacyMsgIds = [];
+    const merged = {}; // uid → { towerName: count }
+
+    for (const msg of allMsgs) {
+        if (msg.author.id !== client.user.id) continue;
+        let parsed;
+        try {
+            const raw = msg.content.replace(/```json\s*|\s*```/g, '').trim();
+            parsed = JSON.parse(raw);
+        } catch { continue; }
+
+        if (parsed.owner) continue; // already new format, skip
+
+        // Legacy bin: all keys are user IDs mapping to tower maps
+        legacyMsgIds.push(msg.id);
+        for (const [uid, towers] of Object.entries(parsed)) {
+            if (typeof towers !== 'object' || Array.isArray(towers)) continue;
+            if (!merged[uid]) merged[uid] = {};
+            Object.assign(merged[uid], towers);
+        }
+    }
+
+    if (legacyMsgIds.length === 0) {
+        console.log('[migrateLegacyRolls] No legacy messages found, nothing to migrate.');
+        return;
+    }
+
+    console.log(`[migrateLegacyRolls] Migrating ${legacyMsgIds.length} legacy messages for ${Object.keys(merged).length} users...`);
+
+    // Write new-format messages for each user
+    const newIndex = new Map();
+    for (const [uid, towers] of Object.entries(merged)) {
+        const ids = await saveUserRollMessages(channel, uid, towers, []);
+        newIndex.set(uid, ids);
+    }
+
+    // Delete all legacy messages
+    for (const id of legacyMsgIds) {
+        try {
+            const msg = await channel.messages.fetch(id, { force: true });
+            await msg.delete();
+        } catch { /* already gone */ }
+    }
+
+    userRollsIndex = newIndex;
+    console.log('[migrateLegacyRolls] Migration complete.');
+}
+
+/**
+ * Save one user's tower data as one or more messages in the channel.
+ * Returns the new ordered list of message IDs for that user.
+ */
+async function saveUserRollMessages(channel, uid, towers, existingIds) {
+    // Split this user's tower map into chunks that fit within MSG_CHAR_LIMIT
+    const chunks = [];
+    let currentChunk = {};
+
+    for (const [towerName, count] of Object.entries(towers)) {
+        const test = { ...currentChunk, [towerName]: count };
+        const testMsg = toMessage({ owner: uid, towers: test });
+        if (testMsg.length > MSG_CHAR_LIMIT && Object.keys(currentChunk).length > 0) {
+            chunks.push({ ...currentChunk });
+            currentChunk = { [towerName]: count };
+        } else {
+            currentChunk = test;
+        }
+    }
+    if (Object.keys(currentChunk).length > 0) chunks.push(currentChunk);
+    if (chunks.length === 0) chunks.push({});
+
+    const newIds = [];
+    for (let i = 0; i < chunks.length; i++) {
+        const content = toMessage({ owner: uid, towers: chunks[i] });
+        if (i < existingIds.length) {
+            try {
+                const msg = await channel.messages.fetch(existingIds[i], { force: true });
+                await msg.edit(content);
+                newIds.push(msg.id);
+            } catch (err) {
+                console.log(`[saveUserRollMessages] Edit failed for ${uid} chunk ${i}: ${err?.message}`);
+                try {
+                    const old = await channel.messages.fetch(existingIds[i], { force: true });
+                    await old.delete();
+                } catch { }
+                const sent = await channel.send(content);
+                newIds.push(sent.id);
+            }
+        } else {
+            const sent = await channel.send(content);
+            newIds.push(sent.id);
+        }
+    }
+
+    // Delete surplus messages for this user
+    for (let i = chunks.length; i < existingIds.length; i++) {
+        try {
+            const msg = await channel.messages.fetch(existingIds[i], { force: true });
+            await msg.delete();
+        } catch { }
+    }
+
+    return newIds;
+}
+
+/** Ensure the index is built. Call before any read/write operation. */
+async function ensureRollsIndex(channel) {
+    if (userRollsIndex !== null) return;
+
+    // Check for legacy messages first and migrate if needed
+    await migrateLegacyRolls(channel);
+
+    if (userRollsIndex !== null) return; // migration set it
+
+    // Build fresh index from new-format messages
+    const index = new Map();
+    let before;
+    const allMsgs = [];
+
+    while (true) {
+        const opts = { limit: 100 };
+        if (before) opts.before = before;
+        const page = await channel.messages.fetch(opts);
+        if (page.size === 0) break;
+        const arr = [...page.values()];
+        allMsgs.push(...arr);
+        if (page.size < 100) break;
+        before = arr.reduce((oldest, m) =>
+            m.createdTimestamp < oldest.createdTimestamp ? m : oldest).id;
+    }
+
+    allMsgs.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+    for (const msg of allMsgs) {
+        if (msg.author.id !== client.user.id) continue;
+        try {
+            const raw = msg.content.replace(/```json\s*|\s*```/g, '').trim();
+            const parsed = JSON.parse(raw);
+            if (!parsed.owner) continue;
+            const uid = parsed.owner;
+            if (!index.has(uid)) index.set(uid, []);
+            index.get(uid).push(msg.id);
+        } catch { continue; }
+    }
+
+    userRollsIndex = index;
+    console.log(`[ensureRollsIndex] Index built: ${index.size} users`);
+}
+
+async function loadTowerRolls(targetUid = null) {
     try {
         const channel = await fetchTowerRollsChannel();
-        const { objects, ids } = await loadAllBins(channel, towerRollsIds);
-        towerRollsIds = ids;
+        await ensureRollsIndex(channel);
 
+        if (targetUid) {
+            // Fast path: only load one user's data
+            const ids = userRollsIndex.get(targetUid) || [];
+            const towers = {};
+            for (const id of ids) {
+                try {
+                    const msg = await channel.messages.fetch(id, { force: true });
+                    const raw = msg.content.replace(/```json\s*|\s*```/g, '').trim();
+                    const parsed = JSON.parse(raw);
+                    Object.assign(towers, parsed.towers || {});
+                } catch { }
+            }
+            console.log(`[loadTowerRolls] Loaded ${Object.keys(towers).length} towers for user ${targetUid}`);
+            return { [targetUid]: towers };
+        }
+
+        // Full load (for ;stats, ;remove, leaderboard, etc.)
         const rolls = {};
-        for (const obj of objects) {
-            for (const [uid, counts] of Object.entries(obj)) {
-                if (!rolls[uid]) rolls[uid] = {};
-                Object.assign(rolls[uid], counts);
+        for (const [uid, ids] of userRollsIndex.entries()) {
+            rolls[uid] = {};
+            for (const id of ids) {
+                try {
+                    const msg = await channel.messages.fetch(id, { force: true });
+                    const raw = msg.content.replace(/```json\s*|\s*```/g, '').trim();
+                    const parsed = JSON.parse(raw);
+                    Object.assign(rolls[uid], parsed.towers || {});
+                } catch { }
             }
         }
-        const userCount = Object.keys(rolls).length;
-        console.log(`[loadTowerRolls] Loaded ${userCount} users across ${objects.length} bins`);
+        console.log(`[loadTowerRolls] Full load: ${Object.keys(rolls).length} users`);
         return rolls;
     } catch (err) {
         console.error('Failed to load tower rolls memory:', err);
@@ -2913,63 +3172,24 @@ async function loadTowerRolls() {
     }
 }
 
-async function saveTowerRolls(rolls) {
+async function saveTowerRolls(rolls, changedUid = null) {
     try {
         const channel = await fetchTowerRollsChannel();
+        await ensureRollsIndex(channel);
 
-        // Build bins, allowing a single user's tower map to be split across
-        // multiple messages when it's too large to fit in one.
-        const bins = [];
-        let currentBin = {};
+        const uidsToSave = changedUid ? [changedUid] : Object.keys(rolls);
 
-        function flushBin() {
-            if (Object.keys(currentBin).length > 0) {
-                bins.push({ ...currentBin });
-                currentBin = {};
+        for (const uid of uidsToSave) {
+            const towers = rolls[uid] || {};
+            const existingIds = userRollsIndex.get(uid) || [];
+            const newIds = await saveUserRollMessages(channel, uid, towers, existingIds);
+            if (newIds.length > 0) {
+                userRollsIndex.set(uid, newIds);
+            } else {
+                userRollsIndex.delete(uid);
             }
+            console.log(`[saveTowerRolls] Saved ${Object.keys(towers).length} towers for user ${uid} across ${newIds.length} message(s)`);
         }
-
-        for (const uid of Object.keys(rolls)) {
-            const userTowers = rolls[uid];
-            if (!userTowers || Object.keys(userTowers).length === 0) continue;
-
-            // Try adding the full user entry to the current bin
-            const testBin = { ...currentBin, [uid]: userTowers };
-            if (toMessage(testBin).length <= MSG_CHAR_LIMIT) {
-                currentBin = testBin;
-                continue;
-            }
-
-            // Doesn't fit whole — flush current bin first
-            flushBin();
-
-            // Now try to fit this user's towers, splitting by individual tower
-            // entries if needed so no single message ever exceeds the limit.
-            let userChunk = {};
-            for (const [towerName, count] of Object.entries(userTowers)) {
-                const testChunk = { ...userChunk, [towerName]: count };
-                const testBinSolo = { [uid]: testChunk };
-                if (toMessage(testBinSolo).length > MSG_CHAR_LIMIT) {
-                    // Flush what we have for this user so far into its own bin
-                    if (Object.keys(userChunk).length > 0) {
-                        bins.push({ [uid]: { ...userChunk } });
-                    }
-                    userChunk = { [towerName]: count };
-                } else {
-                    userChunk = testChunk;
-                }
-            }
-            // Remaining towers for this user become the start of the next bin
-            if (Object.keys(userChunk).length > 0) {
-                currentBin = { [uid]: userChunk };
-            }
-        }
-
-        flushBin();
-        if (bins.length === 0) bins.push({});
-
-        console.log(`[saveTowerRolls] Packed ${Object.keys(rolls).length} users into ${bins.length} bins`);
-        towerRollsIds = await saveBins(channel, bins, towerRollsIds);
     } catch (err) {
         console.error('Failed to save tower rolls memory:', err);
     }
@@ -3029,10 +3249,10 @@ async function handleTowerRoll(message) {
         // Save scores/cooldowns, then update rolls in separate channel
         await saveTowerMemory(data);
 
-        const rolls = await loadTowerRolls();
+        const rolls = await loadTowerRolls(userId);
         if (!rolls[userId]) rolls[userId] = {};
         rolls[userId][tower.name] = (rolls[userId][tower.name] || 0) + 1;
-        await saveTowerRolls(rolls);
+        await saveTowerRolls(rolls, userId);
 
         const forLine = mention ? ` for **${username}**` : '';
         await message.channel.send(
@@ -3047,8 +3267,9 @@ async function handleLeaderboard(message) {
         const data = await loadTowerMemory();
         const scores = data.scores || {};
 
+        const hidden = new Set(data.hiddenFromLb || []);
         const sorted = Object.entries(scores)
-            .filter(([uid]) => uid !== '1154253852476973086')
+            .filter(([uid]) => uid !== '1154253852476973086' && !hidden.has(uid))
             .sort(([, a], [, b]) => b.pts - a.pts)
             .slice(0, 15);
 
@@ -3081,7 +3302,7 @@ async function handleStats(message) {
 
     await enqueueTowerTask(async () => {
         const data = await loadTowerMemory();
-        const rolls = await loadTowerRolls();
+        const rolls = await loadTowerRolls(userId);
 
         const scores = data.scores || {};
         const userScore = scores[userId];
@@ -3140,6 +3361,36 @@ async function handleStats(message) {
     });
 }
 
+async function handleRemoveLb(message, targetId) {
+    await enqueueTowerTask(async () => {
+        const data = await loadTowerMemory();
+        if (!data.hiddenFromLb) data.hiddenFromLb = [];
+
+        if (data.hiddenFromLb.includes(targetId)) {
+            await message.channel.send(`❌ <@${targetId}> is already hidden from the leaderboard.`);
+            return;
+        }
+
+        data.hiddenFromLb.push(targetId);
+        await saveTowerMemory(data);
+        await message.channel.send(`✅ <@${targetId}> will no longer appear on the leaderboard.`);
+    });
+}
+
+async function handleRestoreLb(message, targetId) {
+    await enqueueTowerTask(async () => {
+        const data = await loadTowerMemory();
+        if (!data.hiddenFromLb || !data.hiddenFromLb.includes(targetId)) {
+            await message.channel.send(`❌ <@${targetId}> is not hidden from the leaderboard.`);
+            return;
+        }
+
+        data.hiddenFromLb = data.hiddenFromLb.filter(id => id !== targetId);
+        await saveTowerMemory(data);
+        await message.channel.send(`✅ <@${targetId}> will now appear on the leaderboard again.`);
+    });
+}
+
 async function handleRemoveRoll(message, targetUser, towerQuery) {
     await enqueueTowerTask(async () => {
         const query = towerQuery.toLowerCase();
@@ -3153,19 +3404,17 @@ async function handleRemoveRoll(message, targetUser, towerQuery) {
 
         const userId = targetUser.id;
 
-        const rolls = await loadTowerRolls();
+        const rolls = await loadTowerRolls(userId);
         const userRolls = rolls[userId];
         if (!userRolls || !userRolls[tower.name]) {
             await message.channel.send(`❌ **${targetUser.username}** has no rolls of **${tower.name}**.`);
             return;
         }
 
-        // Decrement roll count, remove entry if it hits 0
         userRolls[tower.name]--;
         if (userRolls[tower.name] <= 0) delete userRolls[tower.name];
-        await saveTowerRolls(rolls);
+        await saveTowerRolls(rolls, userId);
 
-        // Subtract points
         const data = await loadTowerMemory();
         if (data.scores?.[userId]) {
             data.scores[userId].pts = Math.round((data.scores[userId].pts - tower.pts) * 100) / 100;
@@ -3197,7 +3446,6 @@ async function handleAddUser(message, targetUser) {
 
 async function handleGiveRoll(message, targetUser, towerQuery) {
     await enqueueTowerTask(async () => {
-        // Find the tower — case-insensitive partial match
         const query = towerQuery.toLowerCase();
         const tower = TOWERS.find(t => t.name.toLowerCase() === query)
             ?? TOWERS.find(t => t.name.toLowerCase().includes(query));
@@ -3217,10 +3465,10 @@ async function handleGiveRoll(message, targetUser, towerQuery) {
         data.scores[userId].username = username;
         await saveTowerMemory(data);
 
-        const rolls = await loadTowerRolls();
+        const rolls = await loadTowerRolls(userId);
         if (!rolls[userId]) rolls[userId] = {};
         rolls[userId][tower.name] = (rolls[userId][tower.name] || 0) + 1;
-        await saveTowerRolls(rolls);
+        await saveTowerRolls(rolls, userId);
 
         await message.channel.send(
             `✅ Gave **${tower.name}** to **${username}**! *(+${tower.pts} pts, rank #${tower.rank})*`
@@ -4047,12 +4295,22 @@ client.on(Events.MessageCreate, async message => {
     }
 
     // ;remove, ;add, ;give — tower admin only
-    if (['remove', 'add', 'give'].includes(command)) {
+    if (['remove', 'add', 'give', 'removelb', 'restorelb'].includes(command)) {
         if (!TOWER_ADMIN_USERS.includes(message.author.id)) return;
 
         const args = fullContent.slice(command.length).trim();
         const mentionMatch = args.match(/^<@!?(\d+)>/);
         const idMatch = args.match(/^(\d+)/);
+
+        if (command === 'removelb' || command === 'restorelb') {
+            let targetId;
+            if (mentionMatch) targetId = mentionMatch[1];
+            else if (idMatch) targetId = idMatch[1];
+            else return message.reply(`Usage: \`;${command} <@user or user ID>\``);
+            if (command === 'removelb') await handleRemoveLb(message, targetId);
+            else await handleRestoreLb(message, targetId);
+            return;
+        }
 
         if (command === 'remove') {
             let targetId, towerQuery;
