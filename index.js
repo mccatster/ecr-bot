@@ -66,7 +66,8 @@ const VIEW_ALLOWED_USERS = [
     '477575548944777226'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban'];
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'remove', 'add', 'give'];
+const TOWER_ADMIN_USERS = ['477575548944777226'];
 
 const TOWERS = [
   { rank: 1, name: 'S.T.O.N.E Facility: Reborn', pts: 1000.0 },
@@ -3139,6 +3140,80 @@ async function handleStats(message) {
     });
 }
 
+async function handleRemoveUser(message, targetId) {
+    await enqueueTowerTask(async () => {
+        const data = await loadTowerMemory();
+        const rolls = await loadTowerRolls();
+
+        const hadScore = !!data.scores?.[targetId];
+        const hadRolls = !!rolls[targetId];
+
+        if (!hadScore && !hadRolls) {
+            await message.channel.send(`❌ No data found for <@${targetId}>.`);
+            return;
+        }
+
+        delete data.scores[targetId];
+        delete data.cooldowns[targetId];
+        delete rolls[targetId];
+
+        await saveTowerMemory(data);
+        await saveTowerRolls(rolls);
+
+        await message.channel.send(`✅ Removed all tower data for <@${targetId}>.`);
+    });
+}
+
+async function handleAddUser(message, targetUser) {
+    await enqueueTowerTask(async () => {
+        const data = await loadTowerMemory();
+        if (!data.scores) data.scores = {};
+
+        if (data.scores[targetUser.id]) {
+            await message.channel.send(`❌ <@${targetUser.id}> is already on the leaderboard with **${Math.round(data.scores[targetUser.id].pts * 100) / 100}** pts.`);
+            return;
+        }
+
+        data.scores[targetUser.id] = { username: targetUser.username, pts: 0 };
+        await saveTowerMemory(data);
+
+        await message.channel.send(`✅ Added **${targetUser.username}** to the leaderboard with 0 pts.`);
+    });
+}
+
+async function handleGiveRoll(message, targetUser, towerQuery) {
+    await enqueueTowerTask(async () => {
+        // Find the tower — case-insensitive partial match
+        const query = towerQuery.toLowerCase();
+        const tower = TOWERS.find(t => t.name.toLowerCase() === query)
+            ?? TOWERS.find(t => t.name.toLowerCase().includes(query));
+
+        if (!tower) {
+            await message.channel.send(`❌ No tower found matching \`${towerQuery}\`.`);
+            return;
+        }
+
+        const userId = targetUser.id;
+        const username = targetUser.username;
+
+        const data = await loadTowerMemory();
+        if (!data.scores) data.scores = {};
+        if (!data.scores[userId]) data.scores[userId] = { username, pts: 0 };
+        data.scores[userId].pts = Math.round((data.scores[userId].pts + tower.pts) * 100) / 100;
+        data.scores[userId].username = username;
+        await saveTowerMemory(data);
+
+        const rolls = await loadTowerRolls();
+        if (!rolls[userId]) rolls[userId] = {};
+        rolls[userId][tower.name] = (rolls[userId][tower.name] || 0) + 1;
+        await saveTowerRolls(rolls);
+
+        await message.channel.send(
+            `✅ Gave **${tower.name}** to **${username}**! *(+${tower.pts} pts, rank #${tower.rank})*`
+        );
+    });
+}
+
 // ─── Duration parser ──────────────────────────────────────────────────────────
 // Parses strings like "1h", "30m", "7d", "2h30m" into milliseconds
 function parseDuration(str) {
@@ -3955,6 +4030,55 @@ client.on(Events.MessageCreate, async message => {
         if (!parts[0] || !parts[1]) return message.reply('Usage: `;editet <raid id> <timestamp>`');
         await handleEditEndTime(message, parts[0], parts[1]);
         return;
+    }
+
+    // ;remove, ;add, ;give — tower admin only
+    if (['remove', 'add', 'give'].includes(command)) {
+        if (!TOWER_ADMIN_USERS.includes(message.author.id)) return;
+
+        const args = fullContent.slice(command.length).trim();
+        const mentionMatch = args.match(/^<@!?(\d+)>/);
+        const idMatch = args.match(/^(\d+)/);
+
+        if (command === 'remove') {
+            let targetId;
+            if (mentionMatch) targetId = mentionMatch[1];
+            else if (idMatch) targetId = idMatch[1];
+            else return message.reply('Usage: `;remove <@user or user ID>`');
+            await handleRemoveUser(message, targetId);
+            return;
+        }
+
+        if (command === 'add') {
+            let targetId;
+            if (mentionMatch) targetId = mentionMatch[1];
+            else if (idMatch) targetId = idMatch[1];
+            else return message.reply('Usage: `;add <@user or user ID>`');
+            let targetUser;
+            try { targetUser = await client.users.fetch(targetId); }
+            catch { return message.reply('❌ Could not find that user.'); }
+            await handleAddUser(message, targetUser);
+            return;
+        }
+
+        if (command === 'give') {
+            let targetId, towerQuery;
+            if (mentionMatch) {
+                targetId = mentionMatch[1];
+                towerQuery = args.slice(mentionMatch[0].length).trim();
+            } else if (idMatch) {
+                targetId = idMatch[1];
+                towerQuery = args.slice(idMatch[0].length).trim();
+            } else {
+                return message.reply('Usage: `;give <@user or user ID> <tower name>`');
+            }
+            if (!towerQuery) return message.reply('Usage: `;give <@user or user ID> <tower name>`');
+            let targetUser;
+            try { targetUser = await client.users.fetch(targetId); }
+            catch { return message.reply('❌ Could not find that user.'); }
+            await handleGiveRoll(message, targetUser, towerQuery);
+            return;
+        }
     }
 });
 
