@@ -2623,12 +2623,50 @@ const TOWERS = [
 
 const MSG_CHAR_LIMIT = 1900; // conservative ceiling well below Discord's 2000-char hard limit
 
-let towerMemoryWriteLock = Promise.resolve();
+// ─── In-memory cache ──────────────────────────────────────────────────────────
+// All tower data lives here in RAM after the initial load on startup.
+// Commands read/write the cache instantly (synchronous), then a background
+// flush writes the updated data to Discord without blocking the user.
 
+const cache = {
+    ready: false,
+    memory: {
+        scores:       {},   // uid -> { username, pts }
+        cooldowns:    {},   // uid -> expiresAt (ms)
+        hiddenFromLb: [],
+    },
+    rolls: {},              // uid -> { towerName: count }
+};
+
+let flushMemoryPending = false;
+let flushRollsPending  = new Set();
+
+function scheduleFlushMemory() {
+    if (flushMemoryPending) return;
+    flushMemoryPending = true;
+    setImmediate(async () => {
+        flushMemoryPending = false;
+        try { await saveTowerMemory(cache.memory); }
+        catch (e) { console.error('[flush] memory error:', e); }
+    });
+}
+
+function scheduleFlushRolls(uid) {
+    flushRollsPending.add(uid);
+    setImmediate(async () => {
+        const uids = [...flushRollsPending];
+        flushRollsPending.clear();
+        for (const u of uids) {
+            try { await saveTowerRolls(cache.rolls, u); }
+            catch (e) { console.error('[flush] rolls error:', e); }
+        }
+    });
+}
+
+// enqueueTowerTask is kept so call-sites don't need changing.
+// The cache makes everything synchronous so we just run fn() directly.
 function enqueueTowerTask(fn) {
-    const next = towerMemoryWriteLock.then(fn);
-    towerMemoryWriteLock = next.catch(() => {});
-    return next;
+    return fn();
 }
 
 /** Serialise a plain object into a Discord message string. */
@@ -2821,13 +2859,17 @@ function packIntoBins(userIds, makeEntry, makeBin) {
 }
 
 // ─── Main tower memory (scores + cooldowns) ───────────────────────────────────
+// These functions now operate on the in-memory cache and are only called by the
+// background flush — they are never awaited directly by command handlers.
+
 let towerMemoryIds = [];
 
 async function fetchTowerMemoryChannel() {
     return await client.channels.fetch(TOWER_MEMORY_CHANNEL_ID);
 }
 
-async function loadTowerMemory() {
+// Called once on startup to populate cache.memory from Discord.
+async function loadTowerMemoryIntoCache() {
     try {
         const channel = await fetchTowerMemoryChannel();
         const { objects, ids } = await loadAllBins(channel, towerMemoryIds);
@@ -2839,13 +2881,14 @@ async function loadTowerMemory() {
             if (obj.cooldowns)    Object.assign(data.cooldowns, obj.cooldowns);
             if (obj.hiddenFromLb) data.hiddenFromLb = [...new Set([...data.hiddenFromLb, ...obj.hiddenFromLb])];
         }
-        return data;
+        cache.memory = data;
+        console.log('[cache] memory loaded:', Object.keys(data.scores).length, 'users');
     } catch (err) {
-        console.error('Failed to load tower memory:', err);
-        return { scores: {}, cooldowns: {} };
+        console.error('Failed to load tower memory into cache:', err);
     }
 }
 
+// Background writer — serialises cache.memory back to Discord.
 async function saveTowerMemory(data) {
     try {
         const channel = await fetchTowerMemoryChannel();
@@ -2877,13 +2920,18 @@ async function saveTowerMemory(data) {
         );
 
         if (bins.length === 0) bins.push({ scores: {}, cooldowns: {} });
-        // Store hiddenFromLb on the first bin so it's always persisted
         bins[0].hiddenFromLb = data.hiddenFromLb || [];
 
         towerMemoryIds = await saveBins(channel, bins, towerMemoryIds);
     } catch (err) {
         console.error('Failed to save tower memory:', err);
     }
+}
+
+// Shim: older call-sites that do `const data = await loadTowerMemory()` now
+// just read straight from cache — zero Discord API calls.
+function loadTowerMemory() {
+    return Promise.resolve(cache.memory);
 }
 
 // ─── Tower rolls memory (separate channel, one message-group per user) ───────
@@ -3130,48 +3178,15 @@ async function ensureRollsIndex(channel) {
     console.log(`[ensureRollsIndex] Index built: ${index.size} users`);
 }
 
-async function loadTowerRolls(targetUid = null) {
-    try {
-        const channel = await fetchTowerRollsChannel();
-        await ensureRollsIndex(channel);
-
-        if (targetUid) {
-            // Fast path: only load one user's data
-            const ids = userRollsIndex.get(targetUid) || [];
-            const towers = {};
-            for (const id of ids) {
-                try {
-                    const msg = await channel.messages.fetch(id, { force: true });
-                    const raw = msg.content.replace(/```json\s*|\s*```/g, '').trim();
-                    const parsed = JSON.parse(raw);
-                    Object.assign(towers, parsed.towers || {});
-                } catch { }
-            }
-            console.log(`[loadTowerRolls] Loaded ${Object.keys(towers).length} towers for user ${targetUid}`);
-            return { [targetUid]: towers };
-        }
-
-        // Full load (for ;stats, ;remove, leaderboard, etc.)
-        const rolls = {};
-        for (const [uid, ids] of userRollsIndex.entries()) {
-            rolls[uid] = {};
-            for (const id of ids) {
-                try {
-                    const msg = await channel.messages.fetch(id, { force: true });
-                    const raw = msg.content.replace(/```json\s*|\s*```/g, '').trim();
-                    const parsed = JSON.parse(raw);
-                    Object.assign(rolls[uid], parsed.towers || {});
-                } catch { }
-            }
-        }
-        console.log(`[loadTowerRolls] Full load: ${Object.keys(rolls).length} users`);
-        return rolls;
-    } catch (err) {
-        console.error('Failed to load tower rolls memory:', err);
-        return {};
+// Shim: reads directly from cache — zero Discord API calls.
+function loadTowerRolls(targetUid = null) {
+    if (targetUid) {
+        return Promise.resolve({ [targetUid]: cache.rolls[targetUid] || {} });
     }
+    return Promise.resolve(cache.rolls);
 }
 
+// Background writer — called only by scheduleFlushRolls.
 async function saveTowerRolls(rolls, changedUid = null) {
     try {
         const channel = await fetchTowerRollsChannel();
@@ -3192,6 +3207,31 @@ async function saveTowerRolls(rolls, changedUid = null) {
         }
     } catch (err) {
         console.error('Failed to save tower rolls memory:', err);
+    }
+}
+
+// Called once on startup to populate cache.rolls from Discord.
+async function loadTowerRollsIntoCache() {
+    try {
+        const channel = await fetchTowerRollsChannel();
+        await ensureRollsIndex(channel);
+
+        const rolls = {};
+        for (const [uid, ids] of userRollsIndex.entries()) {
+            rolls[uid] = {};
+            for (const id of ids) {
+                try {
+                    const msg = await channel.messages.fetch(id, { force: true });
+                    const raw = msg.content.replace(/```json\s*|\s*```/g, '').trim();
+                    const parsed = JSON.parse(raw);
+                    Object.assign(rolls[uid], parsed.towers || {});
+                } catch { }
+            }
+        }
+        cache.rolls = rolls;
+        console.log('[cache] rolls loaded:', Object.keys(rolls).length, 'users');
+    } catch (err) {
+        console.error('Failed to load tower rolls into cache:', err);
     }
 }
 
@@ -3246,14 +3286,14 @@ async function handleTowerRoll(message) {
             data.cooldowns[message.author.id] = Date.now() + TOWER_COOLDOWN_MS;
         }
 
-        // Save scores/cooldowns, then update rolls in separate channel
-        await saveTowerMemory(data);
+        // Update cache synchronously, then schedule background Discord writes
+        if (!cache.rolls[userId]) cache.rolls[userId] = {};
+        cache.rolls[userId][tower.name] = (cache.rolls[userId][tower.name] || 0) + 1;
 
-        const rolls = await loadTowerRolls(userId);
-        if (!rolls[userId]) rolls[userId] = {};
-        rolls[userId][tower.name] = (rolls[userId][tower.name] || 0) + 1;
-        await saveTowerRolls(rolls, userId);
+        scheduleFlushMemory();
+        scheduleFlushRolls(userId);
 
+        // Respond immediately — no waiting for Discord writes
         const forLine = mention ? ` for **${username}**` : '';
         await message.channel.send(
             `**${message.author.username}** rolled **${tower.name}**${forLine}!! *${ptsRounded} tower point${ptsRounded === 1 ? '' : '(s)'}!*
@@ -3358,118 +3398,105 @@ async function handleStats(message) {
 }
 
 async function handleRemoveLb(message, targetId) {
-    await enqueueTowerTask(async () => {
-        const data = await loadTowerMemory();
-        if (!data.hiddenFromLb) data.hiddenFromLb = [];
+    const data = cache.memory;
+    if (!data.hiddenFromLb) data.hiddenFromLb = [];
 
-        if (data.hiddenFromLb.includes(targetId)) {
-            await message.channel.send(`❌ <@${targetId}> is already hidden from the leaderboard.`);
-            return;
-        }
+    if (data.hiddenFromLb.includes(targetId)) {
+        await message.channel.send(`❌ <@${targetId}> is already hidden from the leaderboard.`);
+        return;
+    }
 
-        data.hiddenFromLb.push(targetId);
-        await saveTowerMemory(data);
-        await message.channel.send(`✅ <@${targetId}> will no longer appear on the leaderboard.`);
-    });
+    data.hiddenFromLb.push(targetId);
+    scheduleFlushMemory();
+    await message.channel.send(`✅ <@${targetId}> will no longer appear on the leaderboard.`);
 }
 
 async function handleRestoreLb(message, targetId) {
-    await enqueueTowerTask(async () => {
-        const data = await loadTowerMemory();
-        if (!data.hiddenFromLb || !data.hiddenFromLb.includes(targetId)) {
-            await message.channel.send(`❌ <@${targetId}> is not hidden from the leaderboard.`);
-            return;
-        }
+    const data = cache.memory;
+    if (!data.hiddenFromLb || !data.hiddenFromLb.includes(targetId)) {
+        await message.channel.send(`❌ <@${targetId}> is not hidden from the leaderboard.`);
+        return;
+    }
 
-        data.hiddenFromLb = data.hiddenFromLb.filter(id => id !== targetId);
-        await saveTowerMemory(data);
-        await message.channel.send(`✅ <@${targetId}> will now appear on the leaderboard again.`);
-    });
+    data.hiddenFromLb = data.hiddenFromLb.filter(id => id !== targetId);
+    scheduleFlushMemory();
+    await message.channel.send(`✅ <@${targetId}> will now appear on the leaderboard again.`);
 }
 
 async function handleRemoveRoll(message, targetUser, towerQuery) {
-    await enqueueTowerTask(async () => {
-        const query = towerQuery.toLowerCase();
-        const tower = TOWERS.find(t => t.name.toLowerCase() === query)
-            ?? TOWERS.find(t => t.name.toLowerCase().includes(query));
+    const query = towerQuery.toLowerCase();
+    const tower = TOWERS.find(t => t.name.toLowerCase() === query)
+        ?? TOWERS.find(t => t.name.toLowerCase().includes(query));
 
-        if (!tower) {
-            await message.channel.send(`❌ No tower found matching \`${towerQuery}\`.`);
-            return;
-        }
+    if (!tower) {
+        await message.channel.send(`❌ No tower found matching \`${towerQuery}\`.`);
+        return;
+    }
 
-        const userId = targetUser.id;
+    const userId = targetUser.id;
+    const userRolls = cache.rolls[userId];
+    if (!userRolls || !userRolls[tower.name]) {
+        await message.channel.send(`❌ **${targetUser.username}** has no rolls of **${tower.name}**.`);
+        return;
+    }
 
-        const rolls = await loadTowerRolls(userId);
-        const userRolls = rolls[userId];
-        if (!userRolls || !userRolls[tower.name]) {
-            await message.channel.send(`❌ **${targetUser.username}** has no rolls of **${tower.name}**.`);
-            return;
-        }
+    userRolls[tower.name]--;
+    if (userRolls[tower.name] <= 0) delete userRolls[tower.name];
 
-        userRolls[tower.name]--;
-        if (userRolls[tower.name] <= 0) delete userRolls[tower.name];
-        await saveTowerRolls(rolls, userId);
+    if (cache.memory.scores?.[userId]) {
+        cache.memory.scores[userId].pts = Math.round((cache.memory.scores[userId].pts - tower.pts) * 100) / 100;
+    }
 
-        const data = await loadTowerMemory();
-        if (data.scores?.[userId]) {
-            data.scores[userId].pts = Math.round((data.scores[userId].pts - tower.pts) * 100) / 100;
-        }
-        await saveTowerMemory(data);
+    scheduleFlushMemory();
+    scheduleFlushRolls(userId);
 
-        await message.channel.send(
-            `✅ Removed one roll of **${tower.name}** from **${targetUser.username}**. *(-${tower.pts} pts)*`
-        );
-    });
+    await message.channel.send(
+        `✅ Removed one roll of **${tower.name}** from **${targetUser.username}**. *(-${tower.pts} pts)*`
+    );
 }
 
 async function handleAddUser(message, targetUser) {
-    await enqueueTowerTask(async () => {
-        const data = await loadTowerMemory();
-        if (!data.scores) data.scores = {};
+    const data = cache.memory;
+    if (!data.scores) data.scores = {};
 
-        if (data.scores[targetUser.id]) {
-            await message.channel.send(`❌ <@${targetUser.id}> is already on the leaderboard with **${Math.round(data.scores[targetUser.id].pts * 100) / 100}** pts.`);
-            return;
-        }
+    if (data.scores[targetUser.id]) {
+        await message.channel.send(`❌ <@${targetUser.id}> is already on the leaderboard with **${Math.round(data.scores[targetUser.id].pts * 100) / 100}** pts.`);
+        return;
+    }
 
-        data.scores[targetUser.id] = { username: targetUser.username, pts: 0 };
-        await saveTowerMemory(data);
-
-        await message.channel.send(`✅ Added **${targetUser.username}** to the leaderboard with 0 pts.`);
-    });
+    data.scores[targetUser.id] = { username: targetUser.username, pts: 0 };
+    scheduleFlushMemory();
+    await message.channel.send(`✅ Added **${targetUser.username}** to the leaderboard with 0 pts.`);
 }
 
 async function handleGiveRoll(message, targetUser, towerQuery) {
-    await enqueueTowerTask(async () => {
-        const query = towerQuery.toLowerCase();
-        const tower = TOWERS.find(t => t.name.toLowerCase() === query)
-            ?? TOWERS.find(t => t.name.toLowerCase().includes(query));
+    const query = towerQuery.toLowerCase();
+    const tower = TOWERS.find(t => t.name.toLowerCase() === query)
+        ?? TOWERS.find(t => t.name.toLowerCase().includes(query));
 
-        if (!tower) {
-            await message.channel.send(`❌ No tower found matching \`${towerQuery}\`.`);
-            return;
-        }
+    if (!tower) {
+        await message.channel.send(`❌ No tower found matching \`${towerQuery}\`.`);
+        return;
+    }
 
-        const userId = targetUser.id;
-        const username = targetUser.username;
+    const userId = targetUser.id;
+    const username = targetUser.username;
 
-        const data = await loadTowerMemory();
-        if (!data.scores) data.scores = {};
-        if (!data.scores[userId]) data.scores[userId] = { username, pts: 0 };
-        data.scores[userId].pts = Math.round((data.scores[userId].pts + tower.pts) * 100) / 100;
-        data.scores[userId].username = username;
-        await saveTowerMemory(data);
+    const data = cache.memory;
+    if (!data.scores) data.scores = {};
+    if (!data.scores[userId]) data.scores[userId] = { username, pts: 0 };
+    data.scores[userId].pts = Math.round((data.scores[userId].pts + tower.pts) * 100) / 100;
+    data.scores[userId].username = username;
 
-        const rolls = await loadTowerRolls(userId);
-        if (!rolls[userId]) rolls[userId] = {};
-        rolls[userId][tower.name] = (rolls[userId][tower.name] || 0) + 1;
-        await saveTowerRolls(rolls, userId);
+    if (!cache.rolls[userId]) cache.rolls[userId] = {};
+    cache.rolls[userId][tower.name] = (cache.rolls[userId][tower.name] || 0) + 1;
 
-        await message.channel.send(
-            `✅ Gave **${tower.name}** to **${username}**! *(+${tower.pts} pts, rank #${tower.rank})*`
-        );
-    });
+    scheduleFlushMemory();
+    scheduleFlushRolls(userId);
+
+    await message.channel.send(
+        `✅ Gave **${tower.name}** to **${username}**! *(+${tower.pts} pts, rank #${tower.rank})*`
+    );
 }
 
 // ─── Duration parser ──────────────────────────────────────────────────────────
@@ -4077,6 +4104,13 @@ for (const [messageId, data] of raidMessages.entries()) {
 client.once(Events.ClientReady, async () => {
     console.log(`ECR Console online as ${client.user.tag}`);
 
+    // Load all tower data into RAM so commands never wait on Discord API reads
+    console.log('[cache] Starting initial load...');
+    await loadTowerMemoryIntoCache();
+    await loadTowerRollsIntoCache();
+    cache.ready = true;
+    console.log('[cache] Ready — all tower data loaded into memory.');
+
     // Restore temp raidban timers from memory channel
     try {
         const guild = client.guilds.cache.first();
@@ -4174,6 +4208,17 @@ client.on(Events.MessageCreate, async message => {
 
     // Tower roll commands (no prefix needed — exact match)
     const rawTrim = message.content.trim();
+
+    // Guard: if the cache isn't ready yet (bot just started), hold off
+    const isTowerCmd = rawTrim === ';tower' || rawTrim.startsWith(';tower ') ||
+        rawTrim === ';toer' || rawTrim.startsWith(';toer ') ||
+        rawTrim === '[]' || rawTrim.startsWith('[] ') ||
+        rawTrim === ';lb' || rawTrim === ';stats' || rawTrim.startsWith(';stats ');
+    if (isTowerCmd && !cache.ready) {
+        await message.channel.send('⏳ Bot is still loading, please try again in a moment!');
+        return;
+    }
+
     if (rawTrim === ';tower' || rawTrim.startsWith(';tower ') ||
         rawTrim === ';toer'  || rawTrim.startsWith(';toer ')  ||
         rawTrim === '[]'     || rawTrim.startsWith('[] ')) {
