@@ -3256,7 +3256,7 @@ async function handleTowerRoll(message) {
 
         const forLine = mention ? ` for **${username}**` : '';
         await message.channel.send(
-            `Rolled **${tower.name}**${forLine}!! *${ptsRounded} tower points!*
+            `**${message.author.username}** rolled **${tower.name}**${forLine}!! *${ptsRounded} tower point${ptsRounded === 1 ? '' : '(s)'}!*
 -# Top #${tower.rank}`
         );
     });
