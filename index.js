@@ -3296,9 +3296,15 @@ async function handleLeaderboard(message) {
 }
 
 async function handleStats(message) {
+    // Parse: ;stats [page] [@user] or ;stats [@user] [page]
     const mention = message.mentions.users.first();
     const targetUser = mention ?? message.author;
     const userId = targetUser.id;
+
+    // Extract page number from the message content (any standalone integer)
+    const contentWithoutMention = message.content.replace(/<@!?\d+>/, '').replace(/^;stats\s*/i, '').trim();
+    const pageArg = parseInt(contentWithoutMention.match(/\d+/)?.[0] ?? '1', 10);
+    const requestedPage = isNaN(pageArg) || pageArg < 1 ? 1 : pageArg;
 
     await enqueueTowerTask(async () => {
         const data = await loadTowerMemory();
@@ -3313,9 +3319,7 @@ async function handleStats(message) {
         const totalPts = userScore ? Math.round(userScore.pts * 100) / 100 : 0;
 
         if (totalRolls === 0) {
-            await message.channel.send(
-                `**${displayName}** hasn't rolled any towers yet!`
-            );
+            await message.channel.send(`**${displayName}** hasn't rolled any towers yet!`);
             return;
         }
 
@@ -3326,38 +3330,30 @@ async function handleStats(message) {
         const sorted = Object.entries(userRolls)
             .sort(([nameA], [nameB]) => (rankOf[nameA] ?? 9999) - (rankOf[nameB] ?? 9999));
 
-        const lines = sorted.map(([name, count]) => `**${name}** — rolled **${count}**x`);
+        const TOWERS_PER_PAGE = 25;
+        const totalPages = Math.ceil(sorted.length / TOWERS_PER_PAGE);
+        const page = Math.min(requestedPage, totalPages);
 
-        // Build description in chunks to respect Discord's 4096 char embed limit
-        const chunks = [];
-        let current = '';
-        for (const line of lines) {
-            if ((current + '\n' + line).length > 3800) {
-                chunks.push(current);
-                current = line;
-            } else {
-                current = current ? current + '\n' + line : line;
-            }
+        const pageEntries = sorted.slice((page - 1) * TOWERS_PER_PAGE, page * TOWERS_PER_PAGE);
+        const lines = pageEntries.map(([name, count]) => {
+            const rank = rankOf[name] ?? '?';
+            return `**${name}** (Rank #${rank}) — rolled **${count}**x`;
+        });
+
+        let description = lines.join('\n');
+        if (totalPages > 1 && page === 1) {
+            description += `\n\n-# Use \`;stats <page>\` to view other pages.`;
         }
-        if (current) chunks.push(current);
 
         const embed = new EmbedBuilder()
             .setTitle(`Tower Stats — ${displayName}`)
-            .setDescription(chunks[0])
+            .setDescription(description)
             .setColor(0xB9B4FF)
-            .setFooter({ text: `Total rolls: ${totalRolls} • Total pts: ${totalPts}` })
+            .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+            .setFooter({ text: `Page ${page}/${totalPages} • Total rolls: ${totalRolls} • Total pts: ${totalPts}` })
             .setTimestamp();
 
         await message.channel.send({ embeds: [embed] });
-
-        // Send overflow pages as follow-up embeds
-        for (let i = 1; i < chunks.length; i++) {
-            const overflow = new EmbedBuilder()
-                .setDescription(chunks[i])
-                .setColor(0xB9B4FF)
-                .setFooter({ text: `Page ${i + 1}` });
-            await message.channel.send({ embeds: [overflow] });
-        }
     });
 }
 
@@ -3828,6 +3824,72 @@ function buildHelpEmbed() {
                 ].join('\n'),
             },
             {
+                name: '🎲  ;tower / ;toer / []',
+                value: [
+                    '**Description:** Rolls a random tower and awards its points to you (or a mentioned user).',
+                    '**Usage:** `;tower [@user]`',
+                    '**Cooldown:** 45 minutes per roller',
+                    '**Who can use:** Anyone',
+                ].join('\n'),
+            },
+            {
+                name: '🏆  ;lb',
+                value: [
+                    '**Description:** Displays the top 15 users on the tower points leaderboard.',
+                    '**Usage:** `;lb`',
+                    '**Who can use:** Anyone',
+                ].join('\n'),
+            },
+            {
+                name: '📊  ;stats',
+                value: [
+                    '**Description:** Shows tower roll stats for yourself or a mentioned user, 25 towers per page.',
+                    '**Usage:** `;stats [page] [@user]`',
+                    '**Examples:** `;stats`, `;stats 2`, `;stats @user`, `;stats 3 @user`',
+                    '**Who can use:** Anyone',
+                ].join('\n'),
+            },
+            {
+                name: '➕  ;add',
+                value: [
+                    '**Description:** Adds a user to the tower leaderboard with 0 points.',
+                    '**Usage:** `;add <@user or user ID>`',
+                    '**Who can use:** Tower admins only',
+                ].join('\n'),
+            },
+            {
+                name: '🎁  ;give',
+                value: [
+                    '**Description:** Gives a specific tower roll to a user and awards its points.',
+                    '**Usage:** `;give <@user or user ID> <tower name>`',
+                    '**Who can use:** Tower admins only',
+                ].join('\n'),
+            },
+            {
+                name: '🗑️  ;remove',
+                value: [
+                    '**Description:** Removes one roll of a specific tower from a user and deducts its points.',
+                    '**Usage:** `;remove <@user or user ID> <tower name>`',
+                    '**Who can use:** Tower admins only',
+                ].join('\n'),
+            },
+            {
+                name: '🙈  ;removelb',
+                value: [
+                    '**Description:** Hides a user from the tower leaderboard.',
+                    '**Usage:** `;removelb <@user or user ID>`',
+                    '**Who can use:** Tower admins only',
+                ].join('\n'),
+            },
+            {
+                name: '👁️  ;restorelb',
+                value: [
+                    '**Description:** Restores a hidden user back to the tower leaderboard.',
+                    '**Usage:** `;restorelb <@user or user ID>`',
+                    '**Who can use:** Tower admins only',
+                ].join('\n'),
+            },
+            {
                 name: '⌨️  ;console',
                 value: [
                     '**Description:** Opens a private console panel to run commands.',
@@ -3836,7 +3898,7 @@ function buildHelpEmbed() {
                 ].join('\n'),
             },
             {
-                name: '📋  ;help',
+                name: '❓  ;help',
                 value: [
                     '**Description:** Displays this command list.',
                     '**Usage:** `;help`',
