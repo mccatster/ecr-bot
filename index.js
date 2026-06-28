@@ -5840,6 +5840,11 @@ async function handleTowerRoll(message) {
 }
 
 async function handleLeaderboard(message) {
+    // Parse optional page number from ;lb 2, ;lb 3, etc.
+    const rawTrim = message.content.trim();
+    const pageArg = parseInt(rawTrim.replace(/^;lb\s*/i, ''), 10);
+    const requestedPage = isNaN(pageArg) || pageArg < 1 ? 1 : pageArg;
+
     await enqueueTowerTask(async () => {
         const data = await loadTowerMemory();
         const scores = data.scores || {};
@@ -5847,25 +5852,48 @@ async function handleLeaderboard(message) {
         const hidden = new Set(data.hiddenFromLb || []);
         const sorted = Object.entries(scores)
             .filter(([uid]) => uid !== '1154253852476973086' && !hidden.has(uid))
-            .sort(([, a], [, b]) => b.pts - a.pts)
-            .slice(0, 15);
+            .sort(([, a], [, b]) => b.pts - a.pts);
 
         if (sorted.length === 0) {
             await message.channel.send('No tower points have been earned yet!');
             return;
         }
 
-        const medals = ['🥇', '🥈', '🥉'];
-        const lines = sorted.map(([uid, entry], i) => {
-            const prefix = medals[i] ?? `**#${i + 1}**`;
+        const PAGE_SIZE = 15;
+        const totalPages = Math.ceil(sorted.length / PAGE_SIZE);
+        const page = Math.min(requestedPage, totalPages);
+        const pageEntries = sorted.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+        // Find the requesting user's rank across the full sorted list
+        const authorRankIndex = sorted.findIndex(([uid]) => uid === message.author.id);
+        const authorRank = authorRankIndex === -1 ? null : authorRankIndex + 1;
+        const authorEntry = authorRank !== null ? sorted[authorRankIndex] : null;
+        const authorPts = authorEntry ? Math.round(authorEntry[1].pts * 100) / 100 : 0;
+
+        const medals = ['🥇', '\ud83e\udd48', '\ud83e\udd49'];
+        const globalOffset = (page - 1) * PAGE_SIZE;
+        const lines = pageEntries.map(([uid, entry], i) => {
+            const globalRank = globalOffset + i + 1;
+            const prefix = globalRank <= 3 ? medals[globalRank - 1] : `**#${globalRank}**`;
             return `${prefix} <@${uid}> — **${Math.round(entry.pts * 100) / 100}** pts`;
         });
 
+        let footerText = `Page ${page}/${totalPages}`;
+        if (totalPages > 1) footerText += ` • Use \`;lb <page>\` to see more`;
+        footerText += ` • ECR Console`;
+
+        let authorRankLine = '';
+        if (authorRank !== null) {
+            const authorPrefix = authorRank <= 3 ? medals[authorRank - 1] : `#${authorRank}`;
+            authorRankLine = `\n\n-# Your placement: ${authorPrefix} — **${authorPts}** pts`;
+        }
+
         const embed = new EmbedBuilder()
             .setTitle('Tower Points Leaderboard')
-            .setDescription(lines.join('\n'))
+            .setDescription(lines.join('\n') + authorRankLine)
             .setColor(0xB9B4FF)
-            .setFooter({ text: 'ECR Console' })
+            .setThumbnail(message.author.displayAvatarURL({ dynamic: true }))
+            .setFooter({ text: footerText })
             .setTimestamp();
 
         await message.channel.send({ embeds: [embed] });
@@ -6412,8 +6440,8 @@ function buildHelpEmbed() {
             {
                 name: '🏆  ;lb',
                 value: [
-                    '**Description:** Displays the top 15 users on the tower points leaderboard.',
-                    '**Usage:** `;lb`',
+                    '**Description:** Displays the tower points leaderboard (15 per page). Shows your rank at the bottom.',
+                    '**Usage:** `;lb` or `;lb <page>`',
                     '**Who can use:** Anyone',
                 ].join('\n'),
             },
@@ -6763,7 +6791,7 @@ client.on(Events.MessageCreate, async message => {
     const isTowerCmd = rawTrim === ';tower' || rawTrim.startsWith(';tower ') ||
         rawTrim === ';toer' || rawTrim.startsWith(';toer ') ||
         rawTrim === '[]' || rawTrim.startsWith('[] ') ||
-        rawTrim === ';lb' || rawTrim === ';stats' || rawTrim.startsWith(';stats ');
+        rawTrim === ';lb' || rawTrim.startsWith(';lb ') || rawTrim === ';stats' || rawTrim.startsWith(';stats ');
     if (isTowerCmd && !cache.ready) {
         await message.channel.send('⏳ Bot is still loading, please try again in a moment!');
         return;
@@ -6776,7 +6804,7 @@ client.on(Events.MessageCreate, async message => {
         return;
     }
 
-    if (rawTrim === ';lb') {
+    if (rawTrim === ';lb' || rawTrim.startsWith(';lb ')) {
         await handleLeaderboard(message);
         return;
     }
