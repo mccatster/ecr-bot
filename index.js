@@ -5831,9 +5831,22 @@ async function handleTowerRoll(message) {
         scheduleFlushRolls(userId);
 
         // Respond immediately — no waiting for Discord writes
+        const DIFF_EMOJI = {
+            8:  '<:Insane2:1520576028114813069>',
+            9:  '<:Extreme2:1520576006694375564>',
+            10: '<:Terrifying2:1520575977594421369>',
+            11: '<:Catastrophic2:1520575949215629313>',
+            12: '<:Horrific2:1520575918815318186>',
+            13: '<:Unreal2:1520575886544339084>',
+        };
+        const diff = TOWER_DIFFICULTY[tower.name] ?? null;
+        const tier = diff !== null ? Math.floor(diff) : null;
+        const diffEmoji = tier !== null ? (DIFF_EMOJI[tier] ?? '') : '';
+        const emojiPrefix = diffEmoji ? `${diffEmoji} ` : '';
+
         const forLine = mention ? ` for **${username}**` : '';
         await message.channel.send(
-            `**${message.author.username}** rolled **${tower.name}**${forLine}!! *${ptsRounded} tower point${ptsRounded === 1 ? '' : '(s)'}!*
+            `**${message.author.username}** rolled ${emojiPrefix}**${tower.name}**${forLine}!! *${ptsRounded} tower point${ptsRounded === 1 ? '' : '(s)'}!*
 -# Top #${tower.rank}`
         );
     });
