@@ -66,7 +66,7 @@ const VIEW_ALLOWED_USERS = [
     '477575548944777226'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'remove', 'add', 'give', 'removelb', 'restorelb', 'update'];
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'remove', 'add', 'give', 'removelb', 'restorelb', 'update', 'speak'];
 const TOWER_ADMIN_USERS = ['477575548944777226'];
 
 const TOWER_DIFFICULTY = {
@@ -6465,6 +6465,14 @@ function buildHelpEmbed() {
                 ].join('\n'),
             },
             {
+                name: '📢  ;speak',
+                value: [
+                    '**Description:** Makes the bot send a message in a specified channel.',
+                    '**Usage:** `;speak <message> <channel id>`',
+                    '**Who can use:** Members with an allowed staff role',
+                ].join('\n'),
+            },
+            {
                 name: '🕙  ;editet',
                 value: [
                     '**Description:** Edits the end time of an existing raid post.',
@@ -6912,6 +6920,33 @@ client.on(Events.MessageCreate, async message => {
             ],
             components: [buildConsoleButton()],
         });
+        return;
+    }
+
+    // ;speak <message> <channel id>
+    if (command === 'speak') {
+        if (!hasPermission(message.member)) return;
+        const args = fullContent.slice('speak'.length).trim();
+        const channelMatch = args.match(/(\d{15,25})\s*$/);
+        if (!channelMatch) {
+            return message.reply('❌ Usage: `;speak <message> <channel id>`');
+        }
+        const targetChannelId = channelMatch[1];
+        const speakMessage = args.slice(0, channelMatch.index).trim();
+        if (!speakMessage) {
+            return message.reply('❌ Usage: `;speak <message> <channel id>`');
+        }
+        try {
+            const targetChannel = await client.channels.fetch(targetChannelId);
+            if (!targetChannel || !targetChannel.isTextBased()) {
+                return message.reply('❌ Could not find a text channel with that ID.');
+            }
+            await targetChannel.send(speakMessage);
+            try { await message.delete(); } catch (_) {}
+        } catch (error) {
+            console.error(error);
+            return message.reply('❌ Failed to send message to that channel.');
+        }
         return;
     }
 
