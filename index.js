@@ -66,7 +66,7 @@ const VIEW_ALLOWED_USERS = [
     '477575548944777226'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'remove', 'add', 'give', 'removelb', 'restorelb'];
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'remove', 'add', 'give', 'removelb', 'restorelb', 'update'];
 const TOWER_ADMIN_USERS = ['477575548944777226'];
 
 const TOWER_DIFFICULTY = {
@@ -5784,6 +5784,22 @@ function formatTimeRemaining(ms) {
     return parts.join(' ') || '1s';
 }
 
+const TOWER_DIFF_EMOJI = {
+    8:  '<:Insane2:1520576028114813069>',
+    9:  '<:Extreme2:1520576006694375564>',
+    10: '<:Terrifying2:1520575977594421369>',
+    11: '<:Catastrophic2:1520575949215629313>',
+    12: '<:Horrific2:1520575918815318186>',
+    13: '<:Unreal2:1520575886544339084>',
+};
+
+function getTowerDiffEmojiPrefix(towerName) {
+    const diff = TOWER_DIFFICULTY[towerName] ?? null;
+    const tier = diff !== null ? Math.floor(diff) : null;
+    const diffEmoji = tier !== null ? (TOWER_DIFF_EMOJI[tier] ?? '') : '';
+    return diffEmoji ? `${diffEmoji} ` : '';
+}
+
 async function handleTowerRoll(message) {
     // Check if a user is mentioned — if so, roll for them instead
     const mention = message.mentions.users.first();
@@ -5831,18 +5847,7 @@ async function handleTowerRoll(message) {
         scheduleFlushRolls(userId);
 
         // Respond immediately — no waiting for Discord writes
-        const DIFF_EMOJI = {
-            8:  '<:Insane2:1520576028114813069>',
-            9:  '<:Extreme2:1520576006694375564>',
-            10: '<:Terrifying2:1520575977594421369>',
-            11: '<:Catastrophic2:1520575949215629313>',
-            12: '<:Horrific2:1520575918815318186>',
-            13: '<:Unreal2:1520575886544339084>',
-        };
-        const diff = TOWER_DIFFICULTY[tower.name] ?? null;
-        const tier = diff !== null ? Math.floor(diff) : null;
-        const diffEmoji = tier !== null ? (DIFF_EMOJI[tier] ?? '') : '';
-        const emojiPrefix = diffEmoji ? `${diffEmoji} ` : '';
+        const emojiPrefix = getTowerDiffEmojiPrefix(tower.name);
 
         const forLine = mention ? ` for **${username}**` : '';
         await message.channel.send(
@@ -6088,6 +6093,65 @@ async function handleGiveRoll(message, targetUser, towerQuery) {
     await message.channel.send(
         `✅ Gave **${tower.name}** to **${username}**! *(+${tower.pts} pts, rank #${tower.rank})*`
     );
+}
+
+// Old roll message format looked like:
+//   Rolled **Tower Name**!! *929.17 tower points!*
+//   -# Top #13
+// This converts a message in that old format to the current format:
+//   **username** rolled <emoji> **Tower Name**!! *929.17 tower points!*
+//   -# Top #13
+async function handleUpdateRollMessage(message, oldMessageId, targetId) {
+    let oldMessage;
+    try {
+        oldMessage = await message.channel.messages.fetch(oldMessageId);
+    } catch {
+        await message.channel.send('❌ Could not find that message in this channel. Make sure you run `;update` in the same channel as the old message.');
+        return;
+    }
+
+    if (oldMessage.author.id !== client.user.id) {
+        await message.channel.send('❌ That message was not sent by this bot, so I won\'t touch it.');
+        return;
+    }
+
+    const match = oldMessage.content.match(/^Rolled\s*\*\*(.+?)\*\*!!/i);
+    if (!match) {
+        await message.channel.send('❌ That doesn\'t look like an old-format roll message (expected it to start with `Rolled **Tower Name**!!`).');
+        return;
+    }
+    const towerName = match[1].trim();
+
+    const tower = TOWERS.find(t => t.name === towerName);
+    if (!tower) {
+        await message.channel.send(`❌ Couldn't find a tower named "${towerName}" in the current tower list — can't safely rebuild the message.`);
+        return;
+    }
+
+    let targetUser;
+    try {
+        targetUser = await client.users.fetch(targetId);
+    } catch {
+        await message.channel.send('❌ Could not find that user.');
+        return;
+    }
+
+    const ptsRounded = Math.round(tower.pts * 100) / 100;
+    const emojiPrefix = getTowerDiffEmojiPrefix(tower.name);
+
+    const newContent =
+        `**${targetUser.username}** rolled ${emojiPrefix}**${tower.name}**!! *${ptsRounded} tower ${ptsRounded === 1 ? 'point' : 'points'}!*\n` +
+        `-# Top #${tower.rank}`;
+
+    try {
+        await oldMessage.edit(newContent);
+    } catch (error) {
+        console.error(error);
+        await message.channel.send('❌ Failed to edit that message (maybe it\'s too old to edit, or I\'m missing permissions).');
+        return;
+    }
+
+    await message.channel.send(`✅ Updated message to the new format for **${targetUser.username}** — **${tower.name}**.`);
 }
 
 // ─── Duration parser ──────────────────────────────────────────────────────────
@@ -6955,6 +7019,18 @@ client.on(Events.MessageCreate, async message => {
         const embed = await buildViewEmbed(message.guild, targetId);
         if (!embed) return message.reply('❌ Could not find that user in this server.');
         await message.channel.send({ embeds: [embed] });
+        return;
+    }
+
+    // ;update <messageId> <userId> — converts an old-format roll message to the new format
+    if (command === 'update') {
+        if (!TOWER_ADMIN_USERS.includes(message.author.id)) return;
+        const args = fullContent.slice('update'.length).trim().split(/\s+/).filter(Boolean);
+        const [oldMessageId, targetId] = args;
+        if (!oldMessageId || !targetId) {
+            return message.reply('Usage: `;update <messageId> <userId>`');
+        }
+        await handleUpdateRollMessage(message, oldMessageId, targetId);
         return;
     }
 
