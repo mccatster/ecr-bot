@@ -6973,7 +6973,7 @@ client.on(Events.MessageCreate, async message => {
 
     // ;speak <message> <channel id>
     if (command === 'speak') {
-        if (!hasPermission(message.member)) return;
+        if (message.author.id !== '477575548944777226') return;
         const args = fullContent.slice('speak'.length).trim();
         const channelMatch = args.match(/(\d{15,25})\s*$/);
         if (!channelMatch) {
