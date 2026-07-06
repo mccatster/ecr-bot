@@ -17,6 +17,11 @@ const fs = require('fs');
 
 const DATA_FILE = './raidMessages.json';
 const MOD_LOG_FILE = './modLogs.json';
+const ALERT_FILE = './cooldownAlerts.json';
+const ALLOWED_CHANNELS_FILE = './allowedTowerChannels.json';
+const ALERT_ADMIN_USER = '477575548944777226';
+const ALERT_NOTIFY_CHANNEL_ID = '1519829722962460873';
+const DEFAULT_ALLOWED_TOWER_CHANNELS = ['1519829722962460873', '1490491292101251144', '1519431863003775108'];
 const RAID_CHANNEL_ID = '1386132453017518272';
 const SUCCESS_CHANNEL_ID = '1490125476671520939';
 const CONSOLE_CHANNEL_ID = '1490491292101251144';
@@ -66,7 +71,7 @@ const VIEW_ALLOWED_USERS = [
     '477575548944777226'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'remove', 'add', 'give', 'removelb', 'restorelb', 'update', 'speak'];
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'remove', 'add', 'give', 'removelb', 'restorelb', 'update', 'speak', 'alert', 'addch'];
 const TOWER_ADMIN_USERS = ['477575548944777226'];
 
 const TOWER_DIFFICULTY = {
@@ -5885,6 +5890,7 @@ async function handleTowerRoll(message) {
         // Set cooldown on the roller
         if (!bypassCooldown) {
             data.cooldowns[message.author.id] = Date.now() + TOWER_COOLDOWN_MS;
+            scheduleCooldownAlert(message.author.id, data.cooldowns[message.author.id]);
         }
 
         // Update cache synchronously, then schedule background Discord writes
@@ -6417,6 +6423,71 @@ function getUserLogs(userId) {
     return logs[userId] || { bans: [], mutes: [], kicks: [], warns: [], raidbans: [], unraidbans: [] };
 }
 
+// ─── Cooldown alert toggle storage ────────────────────────────────────────────
+function loadAlertUsers() {
+    if (fs.existsSync(ALERT_FILE)) {
+        return new Set(JSON.parse(fs.readFileSync(ALERT_FILE, 'utf8')));
+    }
+    return new Set();
+}
+
+function saveAlertUsers(set) {
+    fs.writeFileSync(ALERT_FILE, JSON.stringify([...set], null, 2));
+}
+
+const alertUsers = loadAlertUsers();
+const scheduledAlertTimers = new Map(); // uid -> Timeout
+
+// Schedules (or reschedules) a DM alert for when a user's tower cooldown ends.
+// Safe to call even if alerts are off for the user — it's a no-op in that case.
+function scheduleCooldownAlert(userId, expiresAt) {
+    const existing = scheduledAlertTimers.get(userId);
+    if (existing) clearTimeout(existing);
+    scheduledAlertTimers.delete(userId);
+
+    if (!alertUsers.has(userId)) return;
+
+    const delay = Math.max(0, expiresAt - Date.now());
+    const timer = setTimeout(async () => {
+        scheduledAlertTimers.delete(userId);
+        // Re-check in case alerts were turned off, or a newer cooldown supersedes this one
+        if (!alertUsers.has(userId)) return;
+        if (cache.memory.cooldowns?.[userId] !== expiresAt) return;
+
+        try {
+            const user = await client.users.fetch(userId);
+            await user.send(
+                `**\`\`Your cooldown is up!\`\`** *Ended <t:${Math.floor(expiresAt / 1000)}:R> ago...*\n` +
+                `-# <#${ALERT_NOTIFY_CHANNEL_ID}>`
+            );
+        } catch (err) {
+            console.error(`Failed to send cooldown alert DM to ${userId}:`, err);
+        }
+    }, delay);
+
+    scheduledAlertTimers.set(userId, timer);
+}
+
+function cancelCooldownAlert(userId) {
+    const existing = scheduledAlertTimers.get(userId);
+    if (existing) clearTimeout(existing);
+    scheduledAlertTimers.delete(userId);
+}
+
+// ─── Allowed tower-command channels storage ───────────────────────────────────
+function loadAllowedTowerChannels() {
+    if (fs.existsSync(ALLOWED_CHANNELS_FILE)) {
+        return JSON.parse(fs.readFileSync(ALLOWED_CHANNELS_FILE, 'utf8'));
+    }
+    return [...DEFAULT_ALLOWED_TOWER_CHANNELS];
+}
+
+function saveAllowedTowerChannels(list) {
+    fs.writeFileSync(ALLOWED_CHANNELS_FILE, JSON.stringify(list, null, 2));
+}
+
+const allowedTowerChannels = loadAllowedTowerChannels();
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function loadRaidMessages() {
     if (fs.existsSync(DATA_FILE)) {
@@ -6822,6 +6893,13 @@ client.once(Events.ClientReady, async () => {
     cache.ready = true;
     console.log('[cache] Ready — all tower data loaded into memory.');
 
+    // Restore cooldown alert timers for any alert-enabled users with an active cooldown
+    for (const [uid, expiresAt] of Object.entries(cache.memory.cooldowns || {})) {
+        if (alertUsers.has(uid) && expiresAt > Date.now()) {
+            scheduleCooldownAlert(uid, expiresAt);
+        }
+    }
+
     // Restore temp raidban timers from memory channel
     try {
         const guild = client.guilds.cache.first();
@@ -6927,6 +7005,10 @@ client.on(Events.MessageCreate, async message => {
         rawTrim === ';lb' || rawTrim.startsWith(';lb ') || rawTrim === ';stats' || rawTrim.startsWith(';stats ');
     if (isTowerCmd && !cache.ready) {
         await message.channel.send('⏳ Bot is still loading, please try again in a moment!');
+        return;
+    }
+
+    if (isTowerCmd && !allowedTowerChannels.includes(message.channel.id)) {
         return;
     }
 
@@ -7218,6 +7300,53 @@ client.on(Events.MessageCreate, async message => {
             await handleGiveRoll(message, targetUser, towerQuery);
             return;
         }
+    }
+
+    // ;alert <userid> — toggles DM cooldown-end alerts for that user
+    if (command === 'alert') {
+        if (message.author.id !== ALERT_ADMIN_USER) return;
+
+        const args = fullContent.slice('alert'.length).trim();
+        const mentionMatch = args.match(/^<@!?(\d+)>/);
+        const idMatch = args.match(/^(\d+)/);
+        let targetId;
+        if (mentionMatch) targetId = mentionMatch[1];
+        else if (idMatch) targetId = idMatch[1];
+        else return message.reply('Usage: `;alert <userid>`');
+
+        if (alertUsers.has(targetId)) {
+            alertUsers.delete(targetId);
+            saveAlertUsers(alertUsers);
+            cancelCooldownAlert(targetId);
+            await message.reply(`🔕 Cooldown alerts **disabled** for <@${targetId}>.`);
+        } else {
+            alertUsers.add(targetId);
+            saveAlertUsers(alertUsers);
+            const expiresAt = cache.memory.cooldowns?.[targetId];
+            if (expiresAt && expiresAt > Date.now()) {
+                scheduleCooldownAlert(targetId, expiresAt);
+            }
+            await message.reply(`🔔 Cooldown alerts **enabled** for <@${targetId}>.`);
+        }
+        return;
+    }
+
+    // ;addch <channelid> — adds a channel to the allowed tower/lb/stats channel list
+    if (command === 'addch') {
+        if (message.author.id !== ALERT_ADMIN_USER) return;
+
+        const args = fullContent.slice('addch'.length).trim();
+        const idMatch = args.match(/^(\d+)/);
+        if (!idMatch) return message.reply('Usage: `;addch <channelid>`');
+        const channelId = idMatch[1];
+
+        if (allowedTowerChannels.includes(channelId)) {
+            return message.reply(`❌ <#${channelId}> is already in the allowed channels list.`);
+        }
+        allowedTowerChannels.push(channelId);
+        saveAllowedTowerChannels(allowedTowerChannels);
+        await message.reply(`✅ Added <#${channelId}> to the allowed tower-command channels.`);
+        return;
     }
 });
 
