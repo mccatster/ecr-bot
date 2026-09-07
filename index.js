@@ -71,8 +71,11 @@ const VIEW_ALLOWED_USERS = [
     '477575548944777226'
 ];
 
-const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'remove', 'add', 'give', 'removelb', 'restorelb', 'update', 'speak', 'alert', 'addch'];
+const KNOWN_COMMANDS = ['console', 'raidsetup', 'editst', 'editet', 'help', 'raidban', 'unraidban', 'view', 'tempraidban', 'remove', 'add', 'give', 'removelb', 'restorelb', 'update', 'speak', 'alert', 'addch', 'wait', 'chain'];
 const TOWER_ADMIN_USERS = ['477575548944777226'];
+const CHAIN_ALLOWED_USERS = ['1154253852476973086'];
+const MAX_WAIT_MS = 60 * 60 * 1000; // safety cap: 1 hour
+const MAX_CHAIN_COUNT = 100; // safety cap on repeats
 
 const TOWER_DIFFICULTY = {
   "Tower of It Never Ends": 13.5,
@@ -7284,8 +7287,88 @@ async function handleTempRaidban(ctx, { targetId, durationStr, reason }) {
 }
 
 // ─── Message handler ──────────────────────────────────────────────────────────
-client.on(Events.MessageCreate, async message => {
+// Returns true if the member holds any kind of staff/mod role recognized by the bot.
+// Used to gate ;wait, which is just a delay and safe for any staff member to use
+// while chaining whichever commands they already have permission to run.
+function isStaffMember(member) {
+    if (!member) return false;
+    return hasPermission(member) || hasRaidBanPermission(member) || hasViewPermission(member) ||
+        CONSOLE_ALLOWED_USERS.includes(member.user.id);
+}
+
+// Wraps a discord.js Message in a Proxy that reports a different `.content`
+// while delegating everything else (author, member, guild, reply(), etc.) to
+// the original message. Lets us re-run the single-command dispatcher below
+// once per chained sub-command without duplicating all of its logic.
+function withContent(message, newContent) {
+    return new Proxy(message, {
+        get(target, prop) {
+            if (prop === 'content') return newContent;
+            const value = target[prop];
+            return typeof value === 'function' ? value.bind(target) : value;
+        }
+    });
+}
+
+// Executes a `;cmd1;wait 5s;cmd2;chain 3` style chain, one segment at a time.
+// Each non-wait/chain segment is run through the normal single-command
+// dispatcher (handleMessageCommand) as if it had arrived as its own message.
+async function runCommandChain(message, segments) {
+    let lastCommandSegment = null;
+
+    for (const segment of segments) {
+        const firstWord = segment.split(/\s+/)[0]?.toLowerCase();
+
+        if (firstWord === 'wait') {
+            if (!isStaffMember(message.member)) return;
+            const arg = segment.slice('wait'.length).trim();
+            let ms = parseDuration(arg);
+            if (ms === null && /^\d+$/.test(arg)) ms = parseInt(arg, 10) * 1000;
+            if (!ms) {
+                await message.reply('❌ Usage: `;wait <amount>` e.g. `;wait 60s`, `;wait 5m`');
+                continue;
+            }
+            await new Promise(resolve => setTimeout(resolve, Math.min(ms, MAX_WAIT_MS)));
+            continue;
+        }
+
+        if (firstWord === 'chain') {
+            if (!CHAIN_ALLOWED_USERS.includes(message.author.id)) return;
+            const arg = segment.slice('chain'.length).trim();
+            const count = parseInt(arg, 10);
+            if (!count || count < 1) {
+                await message.reply('❌ Usage: `;chain <number>` — repeats the command before it that many times.');
+                continue;
+            }
+            if (!lastCommandSegment) {
+                await message.reply('❌ `;chain` must come right after another command in the chain.');
+                continue;
+            }
+            const repeatCount = Math.min(count, MAX_CHAIN_COUNT);
+            for (let i = 0; i < repeatCount; i++) {
+                await handleMessageCommand(withContent(message, PREFIX + lastCommandSegment));
+                await new Promise(resolve => setTimeout(resolve, 350)); // small gap to be kind to the API
+            }
+            continue;
+        }
+
+        await handleMessageCommand(withContent(message, PREFIX + segment));
+        lastCommandSegment = segment;
+    }
+}
+
+async function handleMessageCommand(message) {
     if (message.author.bot) return;
+
+    // ;cmd1;wait 5s;cmd2;chain 3 — split chained sub-commands and run them in order
+    if (message.content.startsWith(PREFIX)) {
+        const segments = message.content.slice(PREFIX.length).split(';').map(s => s.trim()).filter(Boolean);
+        if (segments.length > 1) {
+            await runCommandChain(message, segments);
+            return;
+        }
+    }
+
     if (message.content.trim().toLowerCase() === 'hi' && Math.random() < 0.25) {
         await message.channel.send('hi');
         return;
@@ -7644,7 +7727,21 @@ client.on(Events.MessageCreate, async message => {
         await message.reply(`✅ Added <#${channelId}> to the allowed tower-command channels.`);
         return;
     }
-});
+
+    // ;wait <amount> — standalone use; only meaningful inside a chain
+    if (command === 'wait') {
+        if (!isStaffMember(message.member)) return;
+        return message.reply('❌ `;wait` is for chaining commands, e.g. `;raidban <user> <reason>;wait 60s;raidban <user> <reason>`');
+    }
+
+    // ;chain <number> — standalone use; only meaningful right after another command
+    if (command === 'chain') {
+        if (!CHAIN_ALLOWED_USERS.includes(message.author.id)) return;
+        return message.reply('❌ `;chain` must follow another command, e.g. `;tower @user;chain 32`');
+    }
+}
+
+client.on(Events.MessageCreate, handleMessageCommand);
 
 // ─── Interaction handler ──────────────────────────────────────────────────────
 client.on(Events.InteractionCreate, async interaction => {
@@ -7900,6 +7997,6 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
     }
 });
 
-// hi bob
+// hi star
 // shibo sucks at tower rolling
 client.login(process.env.TOKEN);
