@@ -8223,6 +8223,6 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
     }
 });
 
-// hi star
+// hi starlus
 // shibo sucks at tower rolling
 client.login(process.env.TOKEN);
